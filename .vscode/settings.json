@@ -1,0 +1,11 @@
+{
+  "C_Cpp.default.compilerPath": "/usr/bin/clang++",
+  "C_Cpp.default.cppStandard": "c++20",
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/engine/include",
+    "${workspaceFolder}/**"
+  ],
+  "files.associations": {
+    "*.hpp": "cpp"
+  }
+}

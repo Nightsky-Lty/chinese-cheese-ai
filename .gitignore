@@ -1,0 +1,14 @@
+# Compiled output
+/build/
+
+# CMake-generated files
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile.cmake
+
+# Editor and operating-system files
+.DS_Store
+*.swp
+*.swo
