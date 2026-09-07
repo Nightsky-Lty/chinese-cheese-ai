@@ -9,6 +9,8 @@
 
 namespace xiangqi {
 
+class Searcher;
+
 /// @brief 一条已经实际执行的对局记录。
 struct HistoryEntry {
     Move move{};                              ///< 执行的走法。
@@ -25,8 +27,8 @@ struct HistoryEntry {
 /// @brief 管理一盘实际对局的当前局面、走法记录、悔棋与重复局面信息。
 ///
 /// `GameHistory` 只接受合法走法，并保留每一步是否吃子、是否将军等信息。
-/// 重复检测只报告相同局面出现次数；中国象棋中的长将、长捉仍需由后续
-/// 竞赛规则模块结合这些记录判定，不能简单地将三次重复直接判和。
+/// 重复检测本身只报告相同局面出现次数；中国象棋中的长将、长捉由
+/// `CycleAdjudicator` 结合这些记录判定，不能简单地将三次重复直接判和。
 class GameHistory {
 public:
     /// @brief 使用标准初始局面创建一盘新对局。
@@ -64,6 +66,13 @@ public:
     /// @return 自最近一次吃子之后经过的半回合数。
     [[nodiscard]] std::size_t no_capture_plies() const { return no_capture_plies_; }
 
+    /// @brief 查询当前完整规则历史的增量哈希。
+    /// @return 编码起始状态、走法顺序、将军信息和未吃子计数的 64 位哈希。
+    /// @note 该值用于隔离路径相关的置换表条目，不代替局面 Zobrist 哈希。
+    [[nodiscard]] std::uint64_t rule_context_hash() const {
+        return rule_context_hashes_.back();
+    }
+
     /// @brief 查询最后一步走法记录。
     /// @return 有历史时返回最后一条记录，否则返回 `std::nullopt`。
     [[nodiscard]] std::optional<HistoryEntry> last_entry() const;
@@ -92,10 +101,19 @@ public:
     [[nodiscard]] bool is_repetition(std::size_t required_occurrences = 3) const;
 
 private:
+    friend class Searcher;
+
+    /// @brief 执行搜索器已经确认合法的走法并追加完整历史记录。
+    /// @param move 已由当前局面合法走法生成器产生的走法。
+    /// @note 不重复检查合法性，仅供 `Searcher` 使用。
+    void push_legal_move(Move move);
+
     Position position_;
     std::vector<HistoryEntry> entries_;
     // 第一个元素是起始局面，之后每执行一步追加一个局面哈希。
     std::vector<std::uint64_t> position_hashes_;
+    // 与局面时间线同步，增量编码到达每个节点的完整已知规则历史。
+    std::vector<std::uint64_t> rule_context_hashes_;
     // 从最近一次吃子开始累计，供后续自然限着规则判定使用。
     std::size_t no_capture_plies_{0};
 };

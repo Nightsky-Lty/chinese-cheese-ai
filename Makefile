@@ -4,7 +4,7 @@ CPPFLAGS := -Iengine/include
 CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Wpedantic -Wconversion
 
 BUILD_DIR := build/make
-ENGINE_SOURCE := engine/src/position.cpp engine/src/game_history.cpp engine/src/cycle_adjudicator.cpp engine/src/evaluation.cpp engine/src/search.cpp engine/src/transposition_table.cpp
+ENGINE_SOURCE := engine/src/position.cpp engine/src/game_history.cpp engine/src/cycle_adjudicator.cpp engine/src/evaluation.cpp engine/src/move_ordering.cpp engine/src/search.cpp engine/src/transposition_table.cpp
 CLI_SOURCE := engine/src/main.cpp
 TEST_SOURCE := engine/tests/rules_tests.cpp
 

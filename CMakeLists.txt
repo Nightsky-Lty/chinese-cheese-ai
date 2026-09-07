@@ -10,6 +10,7 @@ add_library(xiangqi_engine
     engine/src/cycle_adjudicator.cpp
     engine/src/evaluation.cpp
     engine/src/game_history.cpp
+    engine/src/move_ordering.cpp
     engine/src/position.cpp
     engine/src/search.cpp
     engine/src/transposition_table.cpp

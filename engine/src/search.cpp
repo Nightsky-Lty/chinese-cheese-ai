@@ -1,32 +1,32 @@
 #include "xiangqi/search.hpp"
 
+#include "xiangqi/cycle_adjudicator.hpp"
 #include "xiangqi/evaluation.hpp"
+#include "xiangqi/move_ordering.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <stdexcept>
 
 namespace xiangqi {
 namespace {
-
-/// @brief 计算用于走法排序的吃子启发分。
-/// @param position 走法执行前的局面。
-/// @param move 待评分走法。
-/// @return 吃子走法得到较高分；同为吃子时优先高价值目标和低价值攻击者。
-int move_order_score(const Position& position, Move move) {
-    const Piece captured = position.piece_at(move.to);
-    if (is_empty(captured)) {
-        return 0;
-    }
-    const Piece moving = position.piece_at(move.from);
-    return 10000 + piece_base_value(piece_type(captured)) * 16 -
-           piece_base_value(piece_type(moving));
-}
 
 /// @brief 将无合法走法的节点转换为当前行棋方的失败分数。
 /// @param ply 当前节点距离根节点的半回合数。
 /// @return 带将死距离的负分；越早失败，绝对值越大。
 int terminal_loss_score(int ply) {
     return -kMateScore + ply;
+}
+
+/// @brief 从对局历史提取 Counter Move 所需的上一手信息。
+/// @param history 当前节点的完整历史。
+/// @return 有上一手时返回其走法和移动棋子，否则返回空。
+std::optional<PreviousMoveInfo> previous_move_info(const GameHistory& history) {
+    const std::optional<HistoryEntry> entry = history.last_entry();
+    if (!entry) {
+        return std::nullopt;
+    }
+    return PreviousMoveInfo{entry->move, entry->moved};
 }
 
 }  // namespace
@@ -40,6 +40,11 @@ void Searcher::clear_transposition_table() {
 }
 
 SearchResult Searcher::search(Position& position, const SearchLimits& limits) {
+    GameHistory history(position);
+    return search(history, limits);
+}
+
+SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) {
     if (limits.depth < 0) {
         throw std::invalid_argument("search depth cannot be negative");
     }
@@ -52,6 +57,8 @@ SearchResult Searcher::search(Position& position, const SearchLimits& limits) {
     quiescence_nodes_ = 0;
     tt_hits_ = 0;
     tt_cutoffs_ = 0;
+    tt_move_orderings_ = 0;
+    move_ordering_.clear();
     quiescence_depth_ = limits.quiescence_depth;
     use_transposition_table_ =
         limits.use_transposition_table && limits.algorithm == SearchAlgorithm::AlphaBeta;
@@ -71,7 +78,8 @@ SearchResult Searcher::search(Position& position, const SearchLimits& limits) {
         const std::uint64_t qnodes_before = quiescence_nodes_;
         const std::uint64_t tt_hits_before = tt_hits_;
         const std::uint64_t tt_cutoffs_before = tt_cutoffs_;
-        result = search_iteration(position, 0, limits.algorithm, std::nullopt);
+        const std::uint64_t tt_move_orderings_before = tt_move_orderings_;
+        result = search_iteration(history, 0, limits.algorithm, std::nullopt);
         result.iterations.push_back(IterationResult{
             .depth = 0,
             .best_move = result.best_move,
@@ -81,12 +89,14 @@ SearchResult Searcher::search(Position& position, const SearchLimits& limits) {
             .quiescence_nodes = quiescence_nodes_ - qnodes_before,
             .tt_hits = tt_hits_ - tt_hits_before,
             .tt_cutoffs = tt_cutoffs_ - tt_cutoffs_before,
+            .tt_move_orderings = tt_move_orderings_ - tt_move_orderings_before,
         });
         result.nodes = nodes_;
         result.beta_cutoffs = beta_cutoffs_;
         result.quiescence_nodes = quiescence_nodes_;
         result.tt_hits = tt_hits_;
         result.tt_cutoffs = tt_cutoffs_;
+        result.tt_move_orderings = tt_move_orderings_;
         return result;
     }
 
@@ -97,9 +107,10 @@ SearchResult Searcher::search(Position& position, const SearchLimits& limits) {
         const std::uint64_t qnodes_before = quiescence_nodes_;
         const std::uint64_t tt_hits_before = tt_hits_;
         const std::uint64_t tt_cutoffs_before = tt_cutoffs_;
+        const std::uint64_t tt_move_orderings_before = tt_move_orderings_;
 
         SearchResult iteration = search_iteration(
-            position, current_depth, limits.algorithm, previous_best);
+            history, current_depth, limits.algorithm, previous_best);
         result.best_move = iteration.best_move;
         result.score = iteration.score;
         result.depth = current_depth;
@@ -112,6 +123,7 @@ SearchResult Searcher::search(Position& position, const SearchLimits& limits) {
             .quiescence_nodes = quiescence_nodes_ - qnodes_before,
             .tt_hits = tt_hits_ - tt_hits_before,
             .tt_cutoffs = tt_cutoffs_ - tt_cutoffs_before,
+            .tt_move_orderings = tt_move_orderings_ - tt_move_orderings_before,
         });
 
         if (!iteration.best_move) {
@@ -125,37 +137,49 @@ SearchResult Searcher::search(Position& position, const SearchLimits& limits) {
     result.quiescence_nodes = quiescence_nodes_;
     result.tt_hits = tt_hits_;
     result.tt_cutoffs = tt_cutoffs_;
+    result.tt_move_orderings = tt_move_orderings_;
     return result;
 }
 
-SearchResult Searcher::search_iteration(Position& position, int depth,
+SearchResult Searcher::search_iteration(GameHistory& history, int depth,
                                         SearchAlgorithm algorithm,
                                         std::optional<Move> previous_best) {
     ++nodes_;
     SearchResult result;
     result.depth = depth;
+    Position& position = history.position_;
 
     std::vector<Move> moves = position.generate_legal_moves();
     if (moves.empty()) {
         result.score = terminal_loss_score(0);
         return result;
     }
+    if (const std::optional<int> score = adjudication_score(history, 0)) {
+        result.score = *score;
+        return result;
+    }
     if (depth == 0) {
         result.score = quiescence(
-            position, -kSearchInfinity, kSearchInfinity, 0, 0);
+            history, -kSearchInfinity, kSearchInfinity, 0, 0);
         return result;
     }
 
     std::optional<Move> preferred_move = previous_best;
+    bool preferred_move_from_tt = false;
     if (use_transposition_table_) {
-        if (const TTEntry* entry = transposition_table_.probe(position.hash())) {
+        if (const TTEntry* entry = transposition_table_.probe(transposition_key(history))) {
             ++tt_hits_;
             if (!preferred_move) {
                 preferred_move = entry->best_move;
+                preferred_move_from_tt = true;
             }
         }
     }
-    order_moves(position, moves, preferred_move);
+    if (move_ordering_.order_moves(position, moves, preferred_move, 0,
+                                   previous_move_info(history)) &&
+        preferred_move_from_tt) {
+        ++tt_move_orderings_;
+    }
 
     int best_score = -kSearchInfinity;
     Move best_move = moves.front();
@@ -163,14 +187,14 @@ SearchResult Searcher::search_iteration(Position& position, int depth,
     constexpr int beta = kSearchInfinity;
 
     for (Move move : moves) {
-        const UndoInfo undo = position.do_move(move);
+        history.push_legal_move(move);
         int score = 0;
         if (algorithm == SearchAlgorithm::Negamax) {
-            score = -negamax(position, depth - 1, 1);
+            score = -negamax(history, depth - 1, 1);
         } else {
-            score = -alpha_beta(position, depth - 1, -beta, -alpha, 1);
+            score = -alpha_beta(history, depth - 1, -beta, -alpha, 1);
         }
-        position.undo_move(move, undo);
+        static_cast<void>(history.undo_last());
 
         if (score > best_score) {
             best_score = score;
@@ -184,43 +208,57 @@ SearchResult Searcher::search_iteration(Position& position, int depth,
     result.best_move = best_move;
     result.score = best_score;
     if (use_transposition_table_) {
-        transposition_table_.store(position.hash(), depth, score_to_tt(best_score, 0),
+        transposition_table_.store(transposition_key(history), depth,
+                                   score_to_tt(best_score, 0),
                                    TTBound::Exact, best_move);
     }
     return result;
 }
 
-int Searcher::negamax(Position& position, int depth, int ply) {
+int Searcher::negamax(GameHistory& history, int depth, int ply) {
     ++nodes_;
-    if (depth == 0) {
-        return quiescence(position, -kSearchInfinity, kSearchInfinity, ply, 0);
-    }
+    Position& position = history.position_;
     std::vector<Move> moves = position.generate_legal_moves();
     if (moves.empty()) {
         return terminal_loss_score(ply);
     }
+    if (const std::optional<int> score = adjudication_score(history, ply)) {
+        return *score;
+    }
+    if (depth == 0) {
+        return quiescence(history, -kSearchInfinity, kSearchInfinity, ply, 0);
+    }
 
-    order_moves(position, moves);
+    move_ordering_.order_moves(position, moves, std::nullopt, ply,
+                               previous_move_info(history));
     int best_score = -kSearchInfinity;
     for (Move move : moves) {
-        const UndoInfo undo = position.do_move(move);
-        const int score = -negamax(position, depth - 1, ply + 1);
-        position.undo_move(move, undo);
+        history.push_legal_move(move);
+        const int score = -negamax(history, depth - 1, ply + 1);
+        static_cast<void>(history.undo_last());
         best_score = std::max(best_score, score);
     }
     return best_score;
 }
 
-int Searcher::alpha_beta(Position& position, int depth, int alpha, int beta, int ply) {
+int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, int ply) {
     ++nodes_;
+    Position& position = history.position_;
+    std::vector<Move> moves = position.generate_legal_moves();
+    if (moves.empty()) {
+        return terminal_loss_score(ply);
+    }
+    if (const std::optional<int> score = adjudication_score(history, ply)) {
+        return *score;
+    }
     if (depth == 0) {
-        return quiescence(position, alpha, beta, ply, 0);
+        return quiescence(history, alpha, beta, ply, 0);
     }
 
     const int original_alpha = alpha;
     std::optional<Move> tt_move;
     if (use_transposition_table_) {
-        if (const TTEntry* entry = transposition_table_.probe(position.hash())) {
+        if (const TTEntry* entry = transposition_table_.probe(transposition_key(history))) {
             ++tt_hits_;
             tt_move = entry->best_move;
             if (entry->depth >= depth) {
@@ -235,18 +273,19 @@ int Searcher::alpha_beta(Position& position, int depth, int alpha, int beta, int
         }
     }
 
-    std::vector<Move> moves = position.generate_legal_moves();
-    if (moves.empty()) {
-        return terminal_loss_score(ply);
+    const std::optional<PreviousMoveInfo> previous_move = previous_move_info(history);
+    if (move_ordering_.order_moves(position, moves, tt_move, ply, previous_move) &&
+        tt_move) {
+        ++tt_move_orderings_;
     }
-
-    order_moves(position, moves, tt_move);
     int best_score = -kSearchInfinity;
     Move best_move = moves.front();
+    std::vector<Move> failed_quiet_moves;
     for (Move move : moves) {
-        const UndoInfo undo = position.do_move(move);
-        const int score = -alpha_beta(position, depth - 1, -beta, -alpha, ply + 1);
-        position.undo_move(move, undo);
+        const bool quiet = is_empty(position.piece_at(move.to));
+        history.push_legal_move(move);
+        const int score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
+        static_cast<void>(history.undo_last());
 
         if (score > best_score) {
             best_score = score;
@@ -255,7 +294,15 @@ int Searcher::alpha_beta(Position& position, int depth, int alpha, int beta, int
         alpha = std::max(alpha, score);
         if (alpha >= beta) {
             ++beta_cutoffs_;
+            if (quiet) {
+                move_ordering_.record_quiet_beta_cutoff(
+                    position.side_to_move(), move, ply, depth,
+                    previous_move, failed_quiet_moves);
+            }
             break;
+        }
+        if (quiet) {
+            failed_quiet_moves.push_back(move);
         }
     }
 
@@ -266,19 +313,23 @@ int Searcher::alpha_beta(Position& position, int depth, int alpha, int beta, int
         } else if (best_score >= beta) {
             bound = TTBound::Lower;
         }
-        transposition_table_.store(position.hash(), depth,
+        transposition_table_.store(transposition_key(history), depth,
                                    score_to_tt(best_score, ply), bound, best_move);
     }
     return best_score;
 }
 
-int Searcher::quiescence(Position& position, int alpha, int beta, int ply, int qply) {
+int Searcher::quiescence(GameHistory& history, int alpha, int beta, int ply, int qply) {
     ++quiescence_nodes_;
+    Position& position = history.position_;
 
     const bool checked = position.in_check(position.side_to_move());
     std::vector<Move> moves = position.generate_legal_moves();
     if (moves.empty()) {
         return terminal_loss_score(ply);
+    }
+    if (const std::optional<int> score = adjudication_score(history, ply)) {
+        return *score;
     }
 
     const int stand_pat = evaluate(position);
@@ -305,13 +356,14 @@ int Searcher::quiescence(Position& position, int alpha, int beta, int ply, int q
     }
 
     // 被将军时不能使用静态评分作为候选，必须搜索全部合法应将。
-    order_moves(position, moves);
+    move_ordering_.order_moves(position, moves, std::nullopt, ply,
+                               previous_move_info(history));
     int best_score = checked ? -kSearchInfinity : stand_pat;
     for (Move move : moves) {
-        const UndoInfo undo = position.do_move(move);
+        history.push_legal_move(move);
         ++nodes_;
-        const int score = -quiescence(position, -beta, -alpha, ply + 1, qply + 1);
-        position.undo_move(move, undo);
+        const int score = -quiescence(history, -beta, -alpha, ply + 1, qply + 1);
+        static_cast<void>(history.undo_last());
 
         best_score = std::max(best_score, score);
         alpha = std::max(alpha, score);
@@ -321,6 +373,34 @@ int Searcher::quiescence(Position& position, int alpha, int beta, int ply, int q
         }
     }
     return best_score;
+}
+
+std::optional<int> Searcher::adjudication_score(const GameHistory& history, int ply) {
+    const HistoryVerdict verdict = adjudicate_history(history);
+    switch (verdict) {
+        case HistoryVerdict::Ongoing:
+            return std::nullopt;
+        case HistoryVerdict::DrawByThreefoldRepetition:
+        case HistoryVerdict::DrawByNoCapture:
+            return 0;
+        case HistoryVerdict::RedWinsByBlackPerpetualCheck:
+        case HistoryVerdict::RedWinsByBlackPerpetualChase:
+            return history.position().side_to_move() == Color::Red
+                       ? kMateScore - ply
+                       : -kMateScore + ply;
+        case HistoryVerdict::BlackWinsByRedPerpetualCheck:
+        case HistoryVerdict::BlackWinsByRedPerpetualChase:
+            return history.position().side_to_move() == Color::Black
+                       ? kMateScore - ply
+                       : -kMateScore + ply;
+    }
+    return std::nullopt;
+}
+
+std::uint64_t Searcher::transposition_key(const GameHistory& history) {
+    return history.position().hash() ^
+           std::rotl(history.rule_context_hash(), 23) ^
+           0x7265706574697469ULL;
 }
 
 int Searcher::score_to_tt(int score, int ply) {
@@ -341,19 +421,6 @@ int Searcher::score_from_tt(int score, int ply) {
         return score + ply;
     }
     return score;
-}
-
-void Searcher::order_moves(const Position& position, std::vector<Move>& moves,
-                           std::optional<Move> preferred_move) {
-    std::stable_sort(moves.begin(), moves.end(), [&](Move lhs, Move rhs) {
-        return move_order_score(position, lhs) > move_order_score(position, rhs);
-    });
-    if (preferred_move) {
-        const auto preferred = std::find(moves.begin(), moves.end(), *preferred_move);
-        if (preferred != moves.end()) {
-            std::iter_swap(moves.begin(), preferred);
-        }
-    }
 }
 
 }  // namespace xiangqi

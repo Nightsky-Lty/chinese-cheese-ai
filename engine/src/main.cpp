@@ -50,7 +50,8 @@ int main(int argc, char** argv) {
                           << " qnodes " << iteration.quiescence_nodes
                           << " cutoffs " << iteration.beta_cutoffs
                           << " tthits " << iteration.tt_hits
-                          << " ttcutoffs " << iteration.tt_cutoffs;
+                          << " ttcutoffs " << iteration.tt_cutoffs
+                          << " ttmoves " << iteration.tt_move_orderings;
                 if (iteration.best_move) {
                     std::cout << " bestmove "
                               << xiangqi::move_to_string(*iteration.best_move);
@@ -67,7 +68,8 @@ int main(int argc, char** argv) {
                       << " qnodes " << result.quiescence_nodes
                       << " cutoffs " << result.beta_cutoffs
                       << " tthits " << result.tt_hits
-                      << " ttcutoffs " << result.tt_cutoffs;
+                      << " ttcutoffs " << result.tt_cutoffs
+                      << " ttmoves " << result.tt_move_orderings;
             if (result.best_move) {
                 std::cout << " bestmove " << xiangqi::move_to_string(*result.best_move);
             }

@@ -2,6 +2,7 @@
 #include "xiangqi/evaluation.hpp"
 #include "xiangqi/position.hpp"
 #include "xiangqi/game_history.hpp"
+#include "xiangqi/move_ordering.hpp"
 #include "xiangqi/search.hpp"
 #include "xiangqi/transposition_table.hpp"
 
@@ -141,6 +142,7 @@ void test_game_history_and_repetition() {
     const Position initial = Position::from_fen(
         "4k4/9/9/9/4p4/9/9/9/R8/4K4 w");
     xiangqi::GameHistory history(initial);
+    const std::uint64_t initial_rule_context = history.rule_context_hash();
 
     expect(history.ply_count() == 0, "new history starts at ply zero");
     expect(history.position_hashes().size() == 1,
@@ -173,6 +175,8 @@ void test_game_history_and_repetition() {
     expect(history.current_position_occurrences() == 3,
            "initial position plus two cycles is counted three times");
     expect(history.is_repetition(), "three occurrences trigger repetition indicator");
+    expect(history.rule_context_hash() != initial_rule_context,
+           "rule context distinguishes the same board reached through a longer history");
 
     for (int i = 0; i < 8; ++i) {
         expect(history.undo_last(), "history can undo every stored move");
@@ -185,6 +189,8 @@ void test_game_history_and_repetition() {
            "undo restores the previous no-capture counter");
     expect(history.current_position_occurrences() == 1,
            "undo removes future positions from repetition history");
+    expect(history.rule_context_hash() == initial_rule_context,
+           "undo restores the original rule-context hash");
 }
 
 void test_history_check_and_capture_metadata() {
@@ -309,6 +315,100 @@ void test_perpetual_check_adjudication() {
            "breaking the repeated boundary removes the cycle verdict");
 }
 
+void test_perpetual_chase_adjudication() {
+    // 两个红兵分别作为炮架。红炮在 a1、b1 间往返，每一步都新捉同一辆黑车；
+    // 黑车在 a4、b4 间躲避并最终回到原局面。
+    xiangqi::GameHistory history(Position::from_fen(
+        "4k4/9/9/9/4p4/r8/9/PP7/1C7/4K4 w"));
+    const std::string cycle[]{"b1a1", "a4b4", "a1b1", "b4a4"};
+
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        for (const std::string& text : cycle) {
+            expect(history.play(move(text)), "perpetual-chase move is legal: " + text);
+        }
+    }
+
+    const xiangqi::RepetitionAdjudication result =
+        xiangqi::adjudicate_repetition(history);
+    expect(result.verdict == xiangqi::RepetitionVerdict::RedPerpetualChase,
+           "red cannon is identified as perpetually chasing the same black rook");
+    expect(xiangqi::adjudicate_history(history) ==
+               xiangqi::HistoryVerdict::BlackWinsByRedPerpetualChase,
+           "red perpetual chase is converted into a black win");
+}
+
+void test_unprotected_piece_perpetual_chase() {
+    // 红炮在 a1、c1 间借炮架持续追同一匹无根黑马，覆盖普通真捉分支，
+    // 而不是“炮捉车”弱子捉强子的直接认定分支。
+    xiangqi::GameHistory history(Position::from_fen(
+        "4k4/9/9/9/4p4/n8/9/P1P6/2C6/4K4 w"));
+    const std::string cycle[]{"c1a1", "a4c3", "a1c1", "c3a4"};
+
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        for (const std::string& text : cycle) {
+            expect(history.play(move(text)), "unprotected-chase move is legal: " + text);
+        }
+    }
+
+    expect(xiangqi::adjudicate_repetition(history).verdict ==
+               xiangqi::RepetitionVerdict::RedPerpetualChase,
+           "repeatedly attacking the same unprotected horse is a perpetual chase");
+}
+
+void test_pawn_perpetual_chase_is_allowed() {
+    // 过河红兵横向往返并持续攻击同一辆黑车。a5 红车保护兵，避免黑车的反向
+    // 攻击被误认为另一方长捉。按采用的简化规则，兵卒长捉不负。
+    xiangqi::GameHistory history(Position::from_fen(
+        "4k4/9/9/4r4/R2P5/9/4P4/9/9/4K4 w"));
+    const std::string cycle[]{"d5e5", "e6d6", "e5d5", "d6e6"};
+
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        for (const std::string& text : cycle) {
+            expect(history.play(move(text)), "pawn-chase cycle move is legal: " + text);
+        }
+    }
+
+    expect(xiangqi::adjudicate_repetition(history).verdict ==
+               xiangqi::RepetitionVerdict::Draw,
+           "a pawn repeatedly chasing the same piece remains a repetition draw");
+}
+
+void test_king_perpetual_chase_is_allowed() {
+    // 红帅在 d0、e0 间往返并持续贴捉同一门黑炮。炮与帅相邻且没有炮架，
+    // 不会反过来将军；将帅作为追逐者时不承担长捉责任。
+    xiangqi::GameHistory history(Position::from_fen(
+        "4k4/9/9/9/4p4/9/9/9/3c5/4K4 w"));
+    const std::string cycle[]{"e0d0", "d1e1", "d0e0", "e1d1"};
+
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        for (const std::string& text : cycle) {
+            expect(history.play(move(text)), "king-chase cycle move is legal: " + text);
+        }
+    }
+
+    expect(xiangqi::adjudicate_repetition(history).verdict ==
+               xiangqi::RepetitionVerdict::Draw,
+           "a king repeatedly chasing the same piece remains a repetition draw");
+}
+
+void test_protected_piece_is_not_perpetually_chased() {
+    // 红炮在 a1、c1 间借炮架追黑马；a5、c4 的黑车分别保护马在 a4、c3
+    // 的位置。炮若吃马会被合法反吃，因此每一步都不属于真捉。
+    xiangqi::GameHistory history(Position::from_fen(
+        "4k4/9/9/9/r3p4/n1r6/9/P1P6/2C6/4K4 w"));
+    const std::string cycle[]{"c1a1", "a4c3", "a1c1", "c3a4"};
+
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        for (const std::string& text : cycle) {
+            expect(history.play(move(text)), "protected-chase cycle move is legal: " + text);
+        }
+    }
+
+    expect(xiangqi::adjudicate_repetition(history).verdict ==
+               xiangqi::RepetitionVerdict::Draw,
+           "repeated attacks on a legally protected horse are not a perpetual chase");
+}
+
 void test_no_capture_draw_adjudication() {
     const Position position = Position::from_fen(
         "4k4/9/9/9/4p4/9/9/9/R8/4K4 w");
@@ -374,6 +474,122 @@ void test_piece_base_values() {
            "horse base value is 400");
     expect(xiangqi::piece_base_value(xiangqi::PieceType::King) == 0,
            "king is excluded from static material scoring");
+}
+
+void test_capture_move_ordering() {
+    Position position = Position::from_fen(
+        "4k4/9/9/9/rp7/PRCPp4/9/9/9/4K4 w");
+    const Move pawn_takes_rook = move("a4a5");
+    const Move rook_takes_pawn = move("b4b5");
+    const Move cannon_takes_pawn = move("c4e4");
+    const Move quiet_move = move("c4c5");
+
+    expect(xiangqi::capture_move_order_score(position, pawn_takes_rook) >
+               xiangqi::capture_move_order_score(position, rook_takes_pawn),
+           "capturing a rook is ordered before capturing a pawn");
+    expect(xiangqi::capture_move_order_score(position, cannon_takes_pawn) >
+               xiangqi::capture_move_order_score(position, rook_takes_pawn),
+           "a lower-value attacker is preferred when capturing the same victim type");
+    expect(xiangqi::capture_move_order_score(position, rook_takes_pawn) >
+               xiangqi::capture_move_order_score(position, quiet_move),
+           "captures are ordered before quiet moves");
+
+    std::vector<Move> moves{
+        quiet_move,
+        rook_takes_pawn,
+        pawn_takes_rook,
+        cannon_takes_pawn,
+    };
+    xiangqi::MoveOrdering ordering;
+    expect(!ordering.order_moves(position, moves, std::nullopt, 0, std::nullopt),
+           "capture ordering reports no preferred move when none is supplied");
+    expect(moves[0] == pawn_takes_rook && moves[1] == cannon_takes_pawn &&
+               moves[2] == quiet_move && moves[3] == rook_takes_pawn,
+           "SEE keeps profitable captures first and moves a losing capture behind quiet moves");
+
+    expect(ordering.order_moves(position, moves, quiet_move, 0, std::nullopt) &&
+               moves[0] == quiet_move,
+           "a legal preferred move remains higher priority than every capture");
+}
+
+void test_static_exchange_evaluation() {
+    Position poisoned = Position::from_fen(
+        "3k5/9/9/9/4p4/9/r8/p8/R8/4K4 w");
+    const Position poisoned_before = poisoned;
+    expect(xiangqi::MoveOrdering::static_exchange_evaluation(
+               poisoned, move("a1a2")) == -800,
+           "SEE detects a rook losing eight hundred points after taking a protected pawn");
+    expect(poisoned == poisoned_before,
+           "SEE restores the complete position after a recapture sequence");
+
+    Position winning = Position::from_fen(
+        "3k5/9/9/9/4p4/9/9/r8/P8/4K4 w");
+    expect(xiangqi::MoveOrdering::static_exchange_evaluation(
+               winning, move("a1a2")) == 900,
+           "SEE values an undefended rook capture using evaluator material values");
+}
+
+void test_quiet_check_ordering() {
+    Position position = Position::from_fen(
+        "3k5/9/9/9/9/9/9/9/R8/4K4 w");
+    const Move quiet = move("a1a2");
+    const Move checking = move("a1d1");
+    const Position original = position;
+
+    expect(xiangqi::MoveOrdering::gives_check(position, checking),
+           "move ordering recognizes a non-capturing rook check");
+    expect(!xiangqi::MoveOrdering::gives_check(position, quiet),
+           "move ordering does not mark an ordinary rook move as check");
+
+    xiangqi::MoveOrdering ordering;
+    std::vector<Move> moves{quiet, checking};
+    ordering.order_moves(position, moves, std::nullopt, 0, std::nullopt);
+    expect(moves.front() == checking,
+           "a safe quiet check is ordered before an ordinary quiet move");
+    expect(position == original,
+           "check detection and ordering restore the complete position");
+}
+
+void test_killer_counter_and_history_ordering() {
+    Position position = Position::initial();
+    const Move first = move("b0c2");
+    const Move second = move("h0g2");
+    const Move ordinary = move("a0a1");
+    xiangqi::MoveOrdering killers;
+
+    killers.record_quiet_beta_cutoff(Color::Red, first, 3, 4,
+                                     std::nullopt, {});
+    std::vector<Move> moves{ordinary, second, first};
+    killers.order_moves(position, moves, std::nullopt, 3, std::nullopt);
+    expect(moves.front() == first,
+           "the first killer is preferred over ordinary quiet moves at the same ply");
+
+    killers.record_quiet_beta_cutoff(Color::Red, second, 3, 4,
+                                     std::nullopt, {});
+    moves = {ordinary, first, second};
+    killers.order_moves(position, moves, std::nullopt, 3, std::nullopt);
+    expect(moves[0] == second && moves[1] == first,
+           "a new first killer moves the previous first killer into the second slot");
+
+    xiangqi::MoveOrdering contextual;
+    const xiangqi::PreviousMoveInfo previous{
+        move("a6a5"),
+        xiangqi::make_piece(Color::Black, xiangqi::PieceType::Pawn),
+    };
+    contextual.record_quiet_beta_cutoff(Color::Red, second, 10, 64,
+                                        std::nullopt, {});
+    contextual.record_quiet_beta_cutoff(Color::Red, first, 11, 1,
+                                        previous, {});
+
+    moves = {ordinary, first, second};
+    contextual.order_moves(position, moves, std::nullopt, 20, std::nullopt);
+    expect(moves.front() == second,
+           "history orders a repeatedly successful quiet move before low-history moves");
+
+    moves = {ordinary, first, second};
+    contextual.order_moves(position, moves, std::nullopt, 20, previous);
+    expect(moves.front() == first,
+           "Counter Move outranks quiet-move history when the previous move matches");
 }
 
 void test_search_finds_obvious_capture() {
@@ -566,6 +782,8 @@ void test_search_uses_transposition_table() {
         uncached_searcher.search(uncached_position, uncached_limits);
 
     expect(first.tt_hits > 0, "iterative deepening produces transposition-table hits");
+    expect(first.tt_move_orderings > 0,
+           "a cached best move is reused for ordering when its score is too shallow");
     expect(second.tt_cutoffs > 0, "a repeated search reuses cached score bounds");
     expect(second.nodes < uncached.nodes,
            "cached repeated search visits fewer nodes than an uncached search");
@@ -573,6 +791,97 @@ void test_search_uses_transposition_table() {
            "transposition table preserves score and best-move correctness");
     expect(first_position == second_position && second_position == uncached_position,
            "cached and uncached searches both restore the root position");
+}
+
+void test_search_respects_terminal_history() {
+    const Position position = Position::from_fen(
+        "4k4/9/9/9/4p4/9/9/9/9/4K4 w");
+    xiangqi::GameHistory history(position, xiangqi::kNoCaptureDrawPlies);
+    const std::uint64_t context_before = history.rule_context_hash();
+    xiangqi::Searcher searcher;
+
+    const xiangqi::SearchResult result = searcher.search(
+        history,
+        xiangqi::SearchLimits{.depth = 3,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta});
+
+    expect(!result.best_move.has_value() && result.score == 0,
+           "an already adjudicated 60-move draw ends search at the root");
+    expect(history.position() == position && history.ply_count() == 0 &&
+               history.rule_context_hash() == context_before,
+           "history-aware root adjudication leaves the supplied game unchanged");
+}
+
+void test_search_uses_perpetual_chase_result() {
+    xiangqi::GameHistory history(Position::from_fen(
+        "4k4/9/9/9/4p4/r8/9/PP7/1C7/4K4 w"));
+    const std::string prefix[]{
+        "b1a1", "a4b4", "a1b1", "b4a4",
+        "b1a1", "a4b4", "a1b1",
+    };
+    for (const std::string& text : prefix) {
+        expect(history.play(move(text)), "search chase-prefix move is legal: " + text);
+    }
+
+    const Position before = history.position();
+    const std::size_t plies_before = history.ply_count();
+    const std::uint64_t context_before = history.rule_context_hash();
+    xiangqi::Searcher searcher;
+    const xiangqi::SearchResult result = searcher.search(
+        history,
+        xiangqi::SearchLimits{.depth = 1,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta});
+
+    expect(result.best_move.has_value() && *result.best_move == move("b4a4"),
+           "black completes the repetition that makes the red chaser lose");
+    expect(result.score >= xiangqi::kMateThreshold,
+           "winning a perpetual-chase adjudication receives a decisive score");
+    expect(history.position() == before && history.ply_count() == plies_before &&
+               history.rule_context_hash() == context_before,
+           "perpetual-chase search restores board and history after exploring");
+}
+
+void test_search_avoids_own_perpetual_chase() {
+    xiangqi::GameHistory history(Position::from_fen(
+        "4k4/9/9/9/4p4/r8/9/PP7/1C7/4K4 w"));
+    const std::string prefix[]{
+        "b1a1", "a4b4", "a1b1", "b4a4", "b1a1", "a4b4",
+    };
+    for (const std::string& text : prefix) {
+        expect(history.play(move(text)), "avoid-chase prefix move is legal: " + text);
+    }
+
+    const Position before = history.position();
+    const std::size_t plies_before = history.ply_count();
+    xiangqi::Searcher searcher;
+    const xiangqi::SearchResult result = searcher.search(
+        history,
+        xiangqi::SearchLimits{.depth = 2,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta});
+
+    expect(result.best_move.has_value() && *result.best_move != move("a1b1"),
+           "red avoids continuing a line in which its own long chase loses");
+    expect(history.position() == before && history.ply_count() == plies_before,
+           "avoiding a long chase leaves the caller's history unchanged");
+}
+
+void test_transposition_table_separates_rule_contexts() {
+    const Position position = Position::from_fen(
+        "4k4/9/9/9/4p4/9/9/9/9/4K4 w");
+    xiangqi::Searcher searcher;
+    Position fresh = position;
+    static_cast<void>(searcher.search(
+        fresh,
+        xiangqi::SearchLimits{.depth = 1,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta}));
+
+    xiangqi::GameHistory near_limit(position, xiangqi::kNoCaptureDrawPlies - 1);
+    const xiangqi::SearchResult result = searcher.search(
+        near_limit,
+        xiangqi::SearchLimits{.depth = 1,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta});
+    expect(result.score == 0,
+           "a cached board score cannot override a different 60-move context");
 }
 
 }  // namespace
@@ -590,10 +899,19 @@ int main() {
     test_history_check_and_capture_metadata();
     test_cycle_extraction_and_adjudication();
     test_perpetual_check_adjudication();
+    test_perpetual_chase_adjudication();
+    test_unprotected_piece_perpetual_chase();
+    test_pawn_perpetual_chase_is_allowed();
+    test_king_perpetual_chase_is_allowed();
+    test_protected_piece_is_not_perpetually_chased();
     test_no_capture_draw_adjudication();
     test_evaluation_symmetry_and_material();
     test_advanced_pawn_value();
     test_piece_base_values();
+    test_capture_move_ordering();
+    test_static_exchange_evaluation();
+    test_quiet_check_ordering();
+    test_killer_counter_and_history_ordering();
     test_search_finds_obvious_capture();
     test_negamax_matches_alpha_beta();
     test_search_terminal_and_depth_zero();
@@ -602,6 +920,10 @@ int main() {
     test_iterative_deepening_results();
     test_transposition_table_storage_and_replacement();
     test_search_uses_transposition_table();
+    test_search_respects_terminal_history();
+    test_search_uses_perpetual_chase_result();
+    test_search_avoids_own_perpetual_chase();
+    test_transposition_table_separates_rule_contexts();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
