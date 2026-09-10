@@ -12,6 +12,7 @@ add_library(xiangqi_engine
     engine/src/game_history.cpp
     engine/src/halfka.cpp
     engine/src/move_ordering.cpp
+    engine/src/nnue.cpp
     engine/src/position.cpp
     engine/src/search.cpp
     engine/src/transposition_table.cpp

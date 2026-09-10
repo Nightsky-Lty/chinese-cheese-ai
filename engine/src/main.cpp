@@ -1,9 +1,12 @@
 #include "xiangqi/evaluation.hpp"
+#include "xiangqi/nnue.hpp"
 #include "xiangqi/position.hpp"
 #include "xiangqi/search.hpp"
 
 #include <exception>
+#include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -12,6 +15,7 @@ int main(int argc, char** argv) {
         xiangqi::Position position = xiangqi::Position::initial();
         int search_depth = 0;
         xiangqi::SearchAlgorithm algorithm = xiangqi::SearchAlgorithm::AlphaBeta;
+        std::optional<std::filesystem::path> nnue_path;
         for (int index = 1; index < argc; ++index) {
             const std::string argument = argv[index];
             if (argument == "--fen" && index + 1 < argc) {
@@ -20,17 +24,30 @@ int main(int argc, char** argv) {
                 search_depth = std::stoi(argv[++index]);
             } else if (argument == "--negamax") {
                 algorithm = xiangqi::SearchAlgorithm::Negamax;
+            } else if (argument == "--nnue" && index + 1 < argc) {
+                nnue_path = argv[++index];
             } else {
                 throw std::invalid_argument("unknown or incomplete command-line option: " + argument);
             }
         }
 
+        std::optional<xiangqi::NnueEvaluator> nnue_evaluator;
+        const xiangqi::Evaluator* evaluator = &xiangqi::handcrafted_evaluator();
+        if (nnue_path) {
+            nnue_evaluator.emplace(*nnue_path);
+            evaluator = &*nnue_evaluator;
+        }
+
         std::cout << position.pretty();
-        const xiangqi::EvaluationBreakdown evaluation =
-            xiangqi::evaluate_breakdown(position);
-        std::cout << "evaluation (side to move): " << xiangqi::evaluate(position)
-                  << " [material(red-black): " << evaluation.material
-                  << ", positional(red-black): " << evaluation.positional << "]\n";
+        std::cout << "evaluation (" << evaluator->name()
+                  << ", side to move): " << evaluator->evaluate(position);
+        if (!nnue_evaluator) {
+            const xiangqi::EvaluationBreakdown evaluation =
+                xiangqi::evaluate_breakdown(position);
+            std::cout << " [material(red-black): " << evaluation.material
+                      << ", positional(red-black): " << evaluation.positional << ']';
+        }
+        std::cout << '\n';
         const auto moves = position.generate_legal_moves();
         std::cout << "legal moves: " << moves.size() << '\n';
         for (xiangqi::Move move : moves) {
@@ -39,7 +56,7 @@ int main(int argc, char** argv) {
         std::cout << '\n';
 
         if (search_depth > 0) {
-            xiangqi::Searcher searcher;
+            xiangqi::Searcher searcher(*evaluator);
             const xiangqi::SearchResult result = searcher.search(
                 position,
                 xiangqi::SearchLimits{.depth = search_depth, .algorithm = algorithm});

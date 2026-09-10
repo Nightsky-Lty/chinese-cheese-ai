@@ -4,14 +4,19 @@
 #include "xiangqi/game_history.hpp"
 #include "xiangqi/halfka.hpp"
 #include "xiangqi/move_ordering.hpp"
+#include "xiangqi/nnue.hpp"
 #include "xiangqi/search.hpp"
 #include "xiangqi/transposition_table.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <utility>
 
 namespace {
 
@@ -525,6 +530,85 @@ void test_evaluator_interface_and_search_injection() {
            "custom evaluator search leaves the input position unchanged");
 }
 
+void test_nnue_accumulator_and_forward_inference() {
+    const Position position = Position::from_fen(
+        "4k4/9/9/9/9/9/9/9/9/4K4 w");
+    xiangqi::NnueNetwork network;
+
+    network.feature_biases()[0] = 0.1F;
+    const auto features = xiangqi::active_halfka_features(position, Color::Red);
+    for (std::size_t feature : features) {
+        network.feature_weights()[
+            feature * xiangqi::kNnueAccumulatorSize] = 0.2F;
+    }
+
+    const xiangqi::NnueAccumulator accumulator =
+        network.refresh_accumulator(position, Color::Red);
+    expect(std::abs(accumulator[0] - 0.5F) < 0.0001F,
+           "NNUE accumulator adds its bias and every active HalfKA feature row");
+    expect(accumulator[1] == 0.0F,
+           "unconnected NNUE accumulator neurons remain at their bias");
+
+    network.hidden_weights()[0] = 1.0F;
+    network.output_weights()[0] = 100.0F;
+    network.output_bias() = 1.4F;
+    expect(std::abs(network.forward(position, Color::Red) - 51.4F) < 0.0001F,
+           "NNUE forward pass applies concatenation, hidden layer and output layer");
+    expect(network.evaluate(position, Color::Red) == 51,
+           "NNUE evaluation rounds the float output to an engine score");
+
+    network.feature_biases()[0] = 10.0F;
+    expect(std::abs(network.forward(position, Color::Red) - 101.4F) < 0.0001F,
+           "NNUE feature-transform activation is clipped to one");
+}
+
+void test_nnue_file_round_trip_and_search() {
+    xiangqi::NnueNetwork network;
+    network.feature_biases()[3] = 0.75F;
+    network.feature_weights()[17] = -0.125F;
+    network.hidden_biases()[2] = 0.5F;
+    network.hidden_weights()[29] = 0.25F;
+    network.output_weights()[2] = -3.5F;
+    network.output_bias() = 73.0F;
+
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        "chinese_cheese_ai_nnue_round_trip.bin";
+    network.save(path);
+    xiangqi::NnueNetwork loaded = xiangqi::NnueNetwork::load(path);
+    std::error_code remove_error;
+    std::filesystem::remove(path, remove_error);
+
+    expect(loaded.feature_biases()[3] == 0.75F &&
+               loaded.feature_weights()[17] == -0.125F &&
+               loaded.hidden_biases()[2] == 0.5F &&
+               loaded.hidden_weights()[29] == 0.25F &&
+               loaded.output_weights()[2] == -3.5F &&
+               loaded.output_bias() == 73.0F,
+           "NNUE binary file round trip preserves all layer parameter types");
+    expect(!remove_error, "NNUE round-trip test removes its temporary model file");
+
+    xiangqi::NnueNetwork constant_network;
+    constant_network.output_bias() = 73.0F;
+    xiangqi::NnueEvaluator evaluator(std::move(constant_network));
+    expect(evaluator.name() == "nnue-halfka-f32",
+           "NnueEvaluator exposes its network type");
+
+    Position position = Position::from_fen(
+        "4k4/9/9/9/4p4/9/9/9/9/4K4 w");
+    const Position original = position;
+    xiangqi::Searcher searcher(evaluator);
+    const xiangqi::SearchResult result = searcher.search(
+        position,
+        xiangqi::SearchLimits{.depth = 0,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta,
+                              .quiescence_depth = 0});
+    expect(result.score == 73,
+           "Searcher obtains leaf scores from an injected NnueEvaluator");
+    expect(position == original,
+           "NNUE search leaves the input position unchanged");
+}
+
 void test_advanced_pawn_value() {
     Position home_pawn = Position::from_fen(
         "3k5/9/9/9/9/9/4P4/9/9/4K4 w");
@@ -1008,6 +1092,8 @@ int main() {
     test_no_capture_draw_adjudication();
     test_evaluation_symmetry_and_material();
     test_evaluator_interface_and_search_injection();
+    test_nnue_accumulator_and_forward_inference();
+    test_nnue_file_round_trip_and_search();
     test_advanced_pawn_value();
     test_piece_base_values();
     test_capture_move_ordering();

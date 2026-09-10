@@ -2,15 +2,15 @@
 
 一个从零实现的中国象棋 AI 项目。目前仓库包含一套可独立运行的 C++20
 象棋内核：它能够解析局面、生成合法走法、执行和撤销走法、维护对局历史，
-并使用手工评估函数与 Alpha-Beta 搜索选择着法。
+并使用手工评估或 HalfKA NNUE 模型与 Alpha-Beta 搜索选择着法。
 
 项目的目标不是调用现成象棋引擎，而是逐步完成一套自己的 AI：先建立可靠的
 规则与传统搜索基线，再加入神经网络训练和推理，最后通过独立的 GUI 适配层与
 棋盘界面交互。
 
 > 当前状态：规则引擎、手工评估、Negamax、Alpha-Beta/PVS、静态搜索、迭代加深、
-> 置换表，以及“三次重复、长将、长捉、无吃子”的简化裁决均已实现；神经网络、
-> 训练流水线和 GUI 自动操作尚未实现。
+> 置换表、“三次重复、长将、长捉、无吃子”的简化裁决，以及 float32 NNUE
+> 前向推理均已实现；训练流水线、增量累加器和 GUI 自动操作尚未实现。
 
 ## 项目结构
 
@@ -25,6 +25,7 @@ chinese-cheese-ai/
 │   │   ├── evaluation.hpp            # 手工局面评估
 │   │   ├── halfka.hpp                 # NNUE HalfKA 稀疏输入特征
 │   │   ├── move_ordering.hpp         # SEE、Killer、Counter 与多层 History 排序
+│   │   ├── nnue.hpp                  # NNUE 权重、加载、累加与推理
 │   │   ├── search.hpp                # Negamax、Alpha-Beta 和迭代加深
 │   │   └── transposition_table.hpp   # 置换表
 │   ├── src/                          # 各模块的 C++ 实现和命令行程序
@@ -44,9 +45,10 @@ flowchart LR
     SEARCH["Searcher 搜索器"] --> GH
     GH --> POS["Position 规则与局面"]
     GH --> CA["CycleAdjudicator 循环裁决"]
-    SEARCH --> EVAL["手工评估函数"]
+    SEARCH --> EVAL["Evaluator 统一评估接口"]
+    EVAL --> HCE["HandcraftedEvaluator"]
+    EVAL --> NN["NnueEvaluator"]
     SEARCH --> TT["TranspositionTable 置换表"]
-    NN["未来的神经网络评估"] -.替换或融合.-> EVAL
 ```
 
 ## 实现思路
@@ -125,8 +127,32 @@ flowchart LR
 向量：标准初始局面虽然有 11340 维，但每个视角只激活 32 项。双方将帅也作为
 普通棋子特征被显式包含，这是 HalfKA 与 HalfKP 的主要区别。
 
-当前已完成特征编号和双视角提取接口。后续将在此基础上实现可增量更新的累加器、
-网络结构、权重格式和 C++ 推理；目前搜索仍然使用手工评估器。
+当前 C++ 推理网络固定为：
+
+```text
+HalfKA 11340 → 共享特征变换 256
+红黑累加器按评分视角拼接 256 + 256 = 512
+ClippedReLU → 全连接 32 → ClippedReLU → 输出 1
+```
+
+`NnueNetwork` 能从局面完整计算双方累加器、执行 float32 前向传播并加载或保存
+版本化二进制权重。`NnueEvaluator` 已接入搜索器的统一评估接口。网络输出直接以
+引擎分值为单位，并限制在 ±28000 内，避免与搜索器的将杀分数范围冲突。
+
+权重文件统一使用小端编码，头部依次为 8 字节魔数 `XQNNUEF1`，以及版本、输入
+维度、累加器宽度和隐藏层宽度四个 `uint32`。后续数据均为 float32，排列顺序为：
+
+```text
+feature_bias[256]
+feature_weights[11340][256]
+hidden_bias[32]
+hidden_weights[32][512]
+output_bias[1]
+output_weights[32]
+```
+
+目前推理采用每次从局面完整刷新累加器的正确性基准实现；下一步会增加随走法执行
+和撤销同步更新的增量累加器，以满足深层搜索的性能要求。
 
 ### 5. Negamax 与 Alpha-Beta/PVS 搜索
 
@@ -217,6 +243,9 @@ MVV-LVA 和 SEE 使用手工
 - [x] 可解释的手工评估函数
 - [x] 可注入的 `Evaluator` / `HandcraftedEvaluator` 统一评估接口
 - [x] HalfKA 双视角稀疏特征编号与提取
+- [x] float32 NNUE 全量累加、ClippedReLU 与前向推理
+- [x] 版本化小端 NNUE 权重加载与保存
+- [x] 可注入搜索器的 `NnueEvaluator`
 - [x] 固定深度 Negamax
 - [x] Alpha-Beta 剪枝
 - [x] PVS 零窗口试探与必要的完整窗口重搜
@@ -242,7 +271,7 @@ MVV-LVA 和 SEE 使用手工
 - [ ] 完整竞赛版长捉语义及“一将一捉”等复杂循环责任
 - [ ] 时间控制与可中断搜索
 - [ ] LMR、空步裁剪和期望窗口等搜索增强
-- [ ] HalfKA 增量累加器与 NNUE 网络评估
+- [ ] HalfKA 增量累加器及 SIMD/整数量化优化
 - [ ] Python 自我对弈、数据生成和训练流水线
 - [ ] C++ 神经网络推理与模型加载
 - [ ] UCCI 等标准引擎通信协议
@@ -292,6 +321,12 @@ ctest --test-dir build --output-on-failure
 ./build/make/xiangqi_cli --depth 3 --negamax
 ```
 
+加载已经导出的 NNUE 权重并用于评估和搜索：
+
+```bash
+./build/make/xiangqi_cli --nnue model.nnue --depth 4
+```
+
 载入指定 FEN：
 
 ```bash
@@ -300,7 +335,7 @@ ctest --test-dir build --output-on-failure
   --depth 4
 ```
 
-命令行会输出棋盘、手工评估明细、合法走法，以及每一层迭代加深的最佳着、
+命令行会输出棋盘、当前评估器与评分、合法走法，以及每一层迭代加深的最佳着、
 分数、节点数、剪枝数和置换表统计。
 
 ## 坐标约定
@@ -319,7 +354,7 @@ b0c2
 1. 用更多真实棋例校准长捉例外，并扩展“一将一捉”等复杂循环责任。
 2. 完善着法排序和搜索剪枝，并加入时间管理，形成稳定的传统引擎基线。
 3. 用 Python 建立自我对弈、棋谱解析、样本生成、训练和模型评估流程。
-4. 在 C++ 中实现轻量神经网络推理，用训练模型替换或增强手工评估。
+4. 实现 NNUE 增量累加、量化和 SIMD 优化，并用训练模型评估棋力。
 5. 定义稳定的引擎通信接口，再单独实现棋盘识别与 GUI 操作模块。
 
 将规则引擎、AI 搜索和 GUI 自动化分层，可以让棋力逻辑不依赖某个具体界面，
