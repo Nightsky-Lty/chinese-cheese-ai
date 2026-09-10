@@ -2,6 +2,7 @@
 #include "xiangqi/evaluation.hpp"
 #include "xiangqi/position.hpp"
 #include "xiangqi/game_history.hpp"
+#include "xiangqi/halfka.hpp"
 #include "xiangqi/move_ordering.hpp"
 #include "xiangqi/search.hpp"
 #include "xiangqi/transposition_table.hpp"
@@ -136,6 +137,40 @@ void test_invalid_fen() {
         threw = true;
     }
     expect(threw, "FEN without kings is rejected");
+}
+
+void test_halfka_features() {
+    const Position initial = Position::initial();
+    const xiangqi::HalfKAInput input = xiangqi::extract_halfka_input(initial);
+
+    expect(xiangqi::kHalfKAFeatureDimensions == 11340,
+           "HalfKA has nine king buckets, fourteen piece channels and ninety squares");
+    expect(input[static_cast<std::size_t>(Color::Red)].size() == 32 &&
+               input[static_cast<std::size_t>(Color::Black)].size() == 32,
+           "HalfKA includes every piece, including both kings");
+    expect(input[static_cast<std::size_t>(Color::Red)] ==
+               input[static_cast<std::size_t>(Color::Black)],
+           "rotationally symmetric initial position has equal relative-perspective features");
+
+    for (const auto& features : input) {
+        expect(std::all_of(features.begin(), features.end(), [](std::size_t index) {
+                   return index < xiangqi::kHalfKAFeatureDimensions;
+               }),
+               "every HalfKA index lies inside the feature vector");
+        auto sorted = features;
+        std::sort(sorted.begin(), sorted.end());
+        expect(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end(),
+               "each occupied square activates a distinct HalfKA feature");
+    }
+
+    const Position kings = Position::from_fen("4k4/9/9/9/9/9/9/9/9/4K4 w");
+    const auto king_features = xiangqi::extract_halfka_input(kings);
+    expect(king_features[static_cast<std::size_t>(Color::Red)].size() == 2 &&
+               king_features[static_cast<std::size_t>(Color::Black)].size() == 2,
+           "HalfKA explicitly emits own-king and opponent-king features");
+    expect(king_features[static_cast<std::size_t>(Color::Red)] ==
+               king_features[static_cast<std::size_t>(Color::Black)],
+           "both king-only perspectives use the same canonical orientation");
 }
 
 void test_game_history_and_repetition() {
@@ -454,6 +489,42 @@ void test_evaluation_symmetry_and_material() {
            "default evaluation follows side-to-move perspective");
 }
 
+void test_evaluator_interface_and_search_injection() {
+    class ConstantEvaluator final : public xiangqi::Evaluator {
+    public:
+        [[nodiscard]] std::string_view name() const noexcept override {
+            return "constant-test";
+        }
+
+        [[nodiscard]] int evaluate_for(
+            const Position&, Color perspective) const override {
+            ++calls;
+            return perspective == Color::Red ? 137 : -137;
+        }
+
+        mutable int calls{0};
+    } evaluator;
+
+    const Position position = Position::from_fen(
+        "4k4/9/9/9/4p4/9/9/9/9/4K4 w");
+    expect(evaluator.name() == "constant-test",
+           "Evaluator exposes its implementation name");
+    expect(evaluator.evaluate(position) == 137,
+           "Evaluator converts its perspective API to side-to-move scoring");
+
+    Position search_position = position;
+    xiangqi::Searcher searcher(evaluator);
+    const xiangqi::SearchResult result = searcher.search(
+        search_position,
+        xiangqi::SearchLimits{.depth = 0,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta,
+                              .quiescence_depth = 0});
+    expect(result.score == 137 && evaluator.calls >= 2,
+           "Searcher evaluates leaf nodes through the injected Evaluator");
+    expect(search_position == position,
+           "custom evaluator search leaves the input position unchanged");
+}
+
 void test_advanced_pawn_value() {
     Position home_pawn = Position::from_fen(
         "3k5/9/9/9/9/9/4P4/9/9/4K4 w");
@@ -557,14 +628,14 @@ void test_killer_counter_and_history_ordering() {
     const Move ordinary = move("a0a1");
     xiangqi::MoveOrdering killers;
 
-    killers.record_quiet_beta_cutoff(Color::Red, first, 3, 4,
+    killers.record_quiet_beta_cutoff(position, first, 3, 4,
                                      std::nullopt, {});
     std::vector<Move> moves{ordinary, second, first};
     killers.order_moves(position, moves, std::nullopt, 3, std::nullopt);
     expect(moves.front() == first,
            "the first killer is preferred over ordinary quiet moves at the same ply");
 
-    killers.record_quiet_beta_cutoff(Color::Red, second, 3, 4,
+    killers.record_quiet_beta_cutoff(position, second, 3, 4,
                                      std::nullopt, {});
     moves = {ordinary, first, second};
     killers.order_moves(position, moves, std::nullopt, 3, std::nullopt);
@@ -576,9 +647,9 @@ void test_killer_counter_and_history_ordering() {
         move("a6a5"),
         xiangqi::make_piece(Color::Black, xiangqi::PieceType::Pawn),
     };
-    contextual.record_quiet_beta_cutoff(Color::Red, second, 10, 64,
+    contextual.record_quiet_beta_cutoff(position, second, 10, 64,
                                         std::nullopt, {});
-    contextual.record_quiet_beta_cutoff(Color::Red, first, 11, 1,
+    contextual.record_quiet_beta_cutoff(position, first, 11, 1,
                                         previous, {});
 
     moves = {ordinary, first, second};
@@ -590,6 +661,25 @@ void test_killer_counter_and_history_ordering() {
     contextual.order_moves(position, moves, std::nullopt, 20, previous);
     expect(moves.front() == first,
            "Counter Move outranks quiet-move history when the previous move matches");
+}
+
+void test_piece_to_history_ordering() {
+    Position learned_position = Position::from_fen(
+        "3k5/9/9/9/9/9/9/9/R8/4K4 w");
+    xiangqi::MoveOrdering ordering;
+    ordering.record_quiet_beta_cutoff(
+        learned_position, move("a1a2"), 3, 32, std::nullopt, {});
+
+    // Main History 没见过 a3a2，但 Piece-to History 已学习过“红车走到 a2”。
+    Position new_position = Position::from_fen(
+        "3k5/9/9/9/9/9/R8/2C6/9/4K4 w");
+    const Move cannon_to_a2 = move("c2a2");
+    const Move rook_to_a2 = move("a3a2");
+    std::vector<Move> moves{cannon_to_a2, rook_to_a2};
+    ordering.order_moves(new_position, moves, std::nullopt, 20, std::nullopt);
+
+    expect(moves.front() == rook_to_a2,
+           "Piece-to History transfers a rook-to-target success across different origins");
 }
 
 void test_search_finds_obvious_capture() {
@@ -630,6 +720,10 @@ void test_negamax_matches_alpha_beta() {
            "Alpha-Beta visits fewer nodes than plain Negamax");
     expect(alpha_beta.beta_cutoffs > 0,
            "Alpha-Beta reports at least one cutoff");
+    expect(alpha_beta.pvs_researches > 0,
+           "PVS performs a full-window re-search when a scout search raises alpha");
+    expect(negamax.pvs_researches == 0,
+           "plain Negamax does not perform PVS re-searches");
 }
 
 void test_search_terminal_and_depth_zero() {
@@ -724,6 +818,12 @@ void test_iterative_deepening_results() {
            "final search result equals the deepest completed iteration");
     expect(position == original,
            "all iterative-deepening passes restore the root position");
+    std::uint64_t iteration_researches = 0;
+    for (const xiangqi::IterationResult& iteration : result.iterations) {
+        iteration_researches += iteration.pvs_researches;
+    }
+    expect(iteration_researches == result.pvs_researches,
+           "per-iteration PVS re-search counts add up to the total");
 }
 
 void test_transposition_table_storage_and_replacement() {
@@ -895,6 +995,7 @@ int main() {
     test_flying_generals_and_pin();
     test_check_evasion();
     test_invalid_fen();
+    test_halfka_features();
     test_game_history_and_repetition();
     test_history_check_and_capture_metadata();
     test_cycle_extraction_and_adjudication();
@@ -906,12 +1007,14 @@ int main() {
     test_protected_piece_is_not_perpetually_chased();
     test_no_capture_draw_adjudication();
     test_evaluation_symmetry_and_material();
+    test_evaluator_interface_and_search_injection();
     test_advanced_pawn_value();
     test_piece_base_values();
     test_capture_move_ordering();
     test_static_exchange_evaluation();
     test_quiet_check_ordering();
     test_killer_counter_and_history_ordering();
+    test_piece_to_history_ordering();
     test_search_finds_obvious_capture();
     test_negamax_matches_alpha_beta();
     test_search_terminal_and_depth_zero();

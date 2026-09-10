@@ -51,7 +51,8 @@ int main(int argc, char** argv) {
                           << " cutoffs " << iteration.beta_cutoffs
                           << " tthits " << iteration.tt_hits
                           << " ttcutoffs " << iteration.tt_cutoffs
-                          << " ttmoves " << iteration.tt_move_orderings;
+                          << " ttmoves " << iteration.tt_move_orderings
+                          << " pvsresearches " << iteration.pvs_researches;
                 if (iteration.best_move) {
                     std::cout << " bestmove "
                               << xiangqi::move_to_string(*iteration.best_move);
@@ -60,7 +61,7 @@ int main(int argc, char** argv) {
             }
             std::cout << "search: "
                       << (algorithm == xiangqi::SearchAlgorithm::AlphaBeta
-                              ? "alpha-beta"
+                              ? "alpha-beta/pvs"
                               : "negamax")
                       << " depth " << result.depth
                       << " score " << result.score
@@ -69,7 +70,8 @@ int main(int argc, char** argv) {
                       << " cutoffs " << result.beta_cutoffs
                       << " tthits " << result.tt_hits
                       << " ttcutoffs " << result.tt_cutoffs
-                      << " ttmoves " << result.tt_move_orderings;
+                      << " ttmoves " << result.tt_move_orderings
+                      << " pvsresearches " << result.pvs_researches;
             if (result.best_move) {
                 std::cout << " bestmove " << xiangqi::move_to_string(*result.best_move);
             }

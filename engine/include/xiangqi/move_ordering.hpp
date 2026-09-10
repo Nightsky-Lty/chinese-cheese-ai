@@ -26,7 +26,7 @@ struct PreviousMoveInfo {
 /// @brief 保存并应用搜索过程中积累的走法排序启发。
 class MoveOrdering {
 public:
-    /// @brief 清空 Killer、Counter Move 和 History 启发。
+    /// @brief 清空 Killer、Counter Move、Main History 和 Piece-to History 启发。
     void clear();
 
     /// @brief 判断合法走法执行后是否会将军，并在返回前恢复局面。
@@ -53,13 +53,14 @@ public:
                      std::optional<PreviousMoveInfo> previous_move) const;
 
     /// @brief 记录一次由安静着造成的 Beta 截断并更新各类启发。
-    /// @param side 执行截断走法的一方。
+    /// @param position 截断走法执行前的父局面，用于取得行棋方和移动棋子。
     /// @param move 导致 Beta 截断的安静着。
     /// @param ply 当前节点距根节点的半回合数。
     /// @param depth 当前节点剩余搜索深度，越深的成功获得越大奖励。
     /// @param previous_move 对手上一手棋，用于写入 Counter Move。
     /// @param failed_quiet_moves 本节点在截断前搜索过但失败的安静着。
-    void record_quiet_beta_cutoff(Color side, Move move, int ply, int depth,
+    void record_quiet_beta_cutoff(const Position& position, Move move,
+                                  int ply, int depth,
                                   std::optional<PreviousMoveInfo> previous_move,
                                   const std::vector<Move>& failed_quiet_moves);
 
@@ -69,6 +70,8 @@ private:
 
     std::array<std::array<std::optional<Move>, 2>, kMaxMoveOrderingPly> killers_{};
     std::array<std::array<std::array<int, kBoardSize>, kBoardSize>, 2> history_{};
+    // 棋子编码同时包含阵营和类型；该表跨起点学习“某类棋子走到某格”的经验。
+    std::array<std::array<int, kBoardSize>, kPieceCodeCount> piece_to_history_{};
     std::array<std::array<std::optional<Move>, kBoardSize>, kPieceCodeCount>
         counter_moves_{};
 

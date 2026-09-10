@@ -87,6 +87,7 @@ int capture_move_order_score(const Position& position, Move move) {
 void MoveOrdering::clear() {
     killers_ = {};
     history_ = {};
+    piece_to_history_ = {};
     counter_moves_ = {};
 }
 
@@ -164,11 +165,15 @@ bool MoveOrdering::order_moves(
             continue;
         }
 
-        const int history_score =
+        const Piece moving_piece = position.piece_at(move.from);
+        const int main_history_score =
             history_[color_index(position.side_to_move())][move.from][move.to];
+        const int piece_to_history_score =
+            piece_to_history_[moving_piece][move.to];
         scored_moves.push_back(ScoredMove{
             move,
-            kQuietMoveBase + history_score + (check ? kUnsafeCheckBonus : 0),
+            kQuietMoveBase + main_history_score + piece_to_history_score +
+                (check ? kUnsafeCheckBonus : 0),
         });
     }
 
@@ -182,7 +187,7 @@ bool MoveOrdering::order_moves(
 }
 
 void MoveOrdering::record_quiet_beta_cutoff(
-    Color side, Move move, int ply, int depth,
+    const Position& position, Move move, int ply, int depth,
     std::optional<PreviousMoveInfo> previous_move,
     const std::vector<Move>& failed_quiet_moves) {
     if (ply >= 0 && ply < kMaxMoveOrderingPly) {
@@ -200,11 +205,16 @@ void MoveOrdering::record_quiet_beta_cutoff(
 
     const int bounded_depth = std::clamp(depth, 1, 64);
     const int bonus = bounded_depth * bounded_depth;
-    auto& side_history = history_[color_index(side)];
+    auto& side_history = history_[color_index(position.side_to_move())];
+    const Piece moving_piece = position.piece_at(move.from);
     update_history(side_history[move.from][move.to], bonus);
+    update_history(piece_to_history_[moving_piece][move.to], bonus);
     for (Move failed : failed_quiet_moves) {
         if (failed != move) {
             update_history(side_history[failed.from][failed.to],
+                           -std::max(1, bonus / 2));
+            const Piece failed_piece = position.piece_at(failed.from);
+            update_history(piece_to_history_[failed_piece][failed.to],
                            -std::max(1, bonus / 2));
         }
     }

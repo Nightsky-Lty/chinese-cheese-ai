@@ -1,7 +1,6 @@
 #include "xiangqi/search.hpp"
 
 #include "xiangqi/cycle_adjudicator.hpp"
-#include "xiangqi/evaluation.hpp"
 #include "xiangqi/move_ordering.hpp"
 
 #include <algorithm>
@@ -32,7 +31,10 @@ std::optional<PreviousMoveInfo> previous_move_info(const GameHistory& history) {
 }  // namespace
 
 Searcher::Searcher(std::size_t transposition_table_mb)
-    : transposition_table_(transposition_table_mb) {}
+    : Searcher(handcrafted_evaluator(), transposition_table_mb) {}
+
+Searcher::Searcher(const Evaluator& evaluator, std::size_t transposition_table_mb)
+    : evaluator_(evaluator), transposition_table_(transposition_table_mb) {}
 
 void Searcher::clear_transposition_table() {
     transposition_table_.clear();
@@ -58,6 +60,7 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
     tt_hits_ = 0;
     tt_cutoffs_ = 0;
     tt_move_orderings_ = 0;
+    pvs_researches_ = 0;
     move_ordering_.clear();
     quiescence_depth_ = limits.quiescence_depth;
     use_transposition_table_ =
@@ -79,6 +82,7 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
         const std::uint64_t tt_hits_before = tt_hits_;
         const std::uint64_t tt_cutoffs_before = tt_cutoffs_;
         const std::uint64_t tt_move_orderings_before = tt_move_orderings_;
+        const std::uint64_t pvs_researches_before = pvs_researches_;
         result = search_iteration(history, 0, limits.algorithm, std::nullopt);
         result.iterations.push_back(IterationResult{
             .depth = 0,
@@ -90,6 +94,7 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
             .tt_hits = tt_hits_ - tt_hits_before,
             .tt_cutoffs = tt_cutoffs_ - tt_cutoffs_before,
             .tt_move_orderings = tt_move_orderings_ - tt_move_orderings_before,
+            .pvs_researches = pvs_researches_ - pvs_researches_before,
         });
         result.nodes = nodes_;
         result.beta_cutoffs = beta_cutoffs_;
@@ -97,6 +102,7 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
         result.tt_hits = tt_hits_;
         result.tt_cutoffs = tt_cutoffs_;
         result.tt_move_orderings = tt_move_orderings_;
+        result.pvs_researches = pvs_researches_;
         return result;
     }
 
@@ -108,6 +114,7 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
         const std::uint64_t tt_hits_before = tt_hits_;
         const std::uint64_t tt_cutoffs_before = tt_cutoffs_;
         const std::uint64_t tt_move_orderings_before = tt_move_orderings_;
+        const std::uint64_t pvs_researches_before = pvs_researches_;
 
         SearchResult iteration = search_iteration(
             history, current_depth, limits.algorithm, previous_best);
@@ -124,6 +131,7 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
             .tt_hits = tt_hits_ - tt_hits_before,
             .tt_cutoffs = tt_cutoffs_ - tt_cutoffs_before,
             .tt_move_orderings = tt_move_orderings_ - tt_move_orderings_before,
+            .pvs_researches = pvs_researches_ - pvs_researches_before,
         });
 
         if (!iteration.best_move) {
@@ -138,6 +146,7 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
     result.tt_hits = tt_hits_;
     result.tt_cutoffs = tt_cutoffs_;
     result.tt_move_orderings = tt_move_orderings_;
+    result.pvs_researches = pvs_researches_;
     return result;
 }
 
@@ -186,13 +195,22 @@ SearchResult Searcher::search_iteration(GameHistory& history, int depth,
     int alpha = -kSearchInfinity;
     constexpr int beta = kSearchInfinity;
 
+    bool first_move = true;
     for (Move move : moves) {
         history.push_legal_move(move);
         int score = 0;
         if (algorithm == SearchAlgorithm::Negamax) {
             score = -negamax(history, depth - 1, 1);
-        } else {
+        } else if (first_move) {
+            // 主变化候选使用完整窗口，建立当前根节点的可靠 Alpha。
             score = -alpha_beta(history, depth - 1, -beta, -alpha, 1);
+        } else {
+            // 后续着先用零窗口判断是否能够超过当前最佳分数。
+            score = -alpha_beta(history, depth - 1, -alpha - 1, -alpha, 1);
+            if (score > alpha && score < beta) {
+                ++pvs_researches_;
+                score = -alpha_beta(history, depth - 1, -beta, -alpha, 1);
+            }
         }
         static_cast<void>(history.undo_last());
 
@@ -203,6 +221,7 @@ SearchResult Searcher::search_iteration(GameHistory& history, int depth,
         if (algorithm == SearchAlgorithm::AlphaBeta) {
             alpha = std::max(alpha, score);
         }
+        first_move = false;
     }
 
     result.best_move = best_move;
@@ -281,10 +300,20 @@ int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, i
     int best_score = -kSearchInfinity;
     Move best_move = moves.front();
     std::vector<Move> failed_quiet_moves;
+    bool first_move = true;
     for (Move move : moves) {
         const bool quiet = is_empty(position.piece_at(move.to));
         history.push_legal_move(move);
-        const int score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
+        int score = 0;
+        if (first_move) {
+            score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
+        } else {
+            score = -alpha_beta(history, depth - 1, -alpha - 1, -alpha, ply + 1);
+            if (score > alpha && score < beta) {
+                ++pvs_researches_;
+                score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
+            }
+        }
         static_cast<void>(history.undo_last());
 
         if (score > best_score) {
@@ -296,7 +325,7 @@ int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, i
             ++beta_cutoffs_;
             if (quiet) {
                 move_ordering_.record_quiet_beta_cutoff(
-                    position.side_to_move(), move, ply, depth,
+                    position, move, ply, depth,
                     previous_move, failed_quiet_moves);
             }
             break;
@@ -304,6 +333,7 @@ int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, i
         if (quiet) {
             failed_quiet_moves.push_back(move);
         }
+        first_move = false;
     }
 
     if (use_transposition_table_) {
@@ -332,7 +362,7 @@ int Searcher::quiescence(GameHistory& history, int alpha, int beta, int ply, int
         return *score;
     }
 
-    const int stand_pat = evaluate(position);
+    const int stand_pat = evaluator_.evaluate(position);
     if (qply >= quiescence_depth_) {
         return stand_pat;
     }

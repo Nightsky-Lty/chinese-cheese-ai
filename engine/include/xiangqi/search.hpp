@@ -1,5 +1,6 @@
 #pragma once
 
+#include "xiangqi/evaluation.hpp"
 #include "xiangqi/game_history.hpp"
 #include "xiangqi/move_ordering.hpp"
 #include "xiangqi/transposition_table.hpp"
@@ -18,7 +19,7 @@ constexpr int kSearchInfinity = 32000;
 /// @brief 选择用于固定深度搜索的算法。
 enum class SearchAlgorithm {
     Negamax,   ///< 不剪枝的完整 Negamax，用作正确性基准。
-    AlphaBeta, ///< 使用 Alpha-Beta 窗口剪枝的 Negamax。
+    AlphaBeta, ///< 使用 Alpha-Beta 剪枝和 PVS 零窗口试探的 Negamax。
 };
 
 /// @brief 一次搜索的限制参数。
@@ -40,6 +41,7 @@ struct IterationResult {
     std::uint64_t tt_hits{0};          ///< 本轮完整键匹配的置换表查询次数。
     std::uint64_t tt_cutoffs{0};       ///< 本轮直接复用缓存边界返回的次数。
     std::uint64_t tt_move_orderings{0}; ///< 本轮使用缓存最佳着进行排序的次数。
+    std::uint64_t pvs_researches{0};    ///< 本轮零窗口提高 Alpha 后执行完整重搜的次数。
 };
 
 /// @brief 一次搜索返回的最佳走法、评分和统计信息。
@@ -53,6 +55,7 @@ struct SearchResult {
     std::uint64_t tt_hits{0};          ///< 完整键匹配的置换表查询总次数。
     std::uint64_t tt_cutoffs{0};       ///< 直接复用缓存边界返回的总次数。
     std::uint64_t tt_move_orderings{0}; ///< 使用缓存最佳着进行排序的总次数。
+    std::uint64_t pvs_researches{0};    ///< 零窗口提高 Alpha 后执行完整重搜的总次数。
     std::vector<IterationResult> iterations{}; ///< 按深度递增排列的完整迭代结果。
 };
 
@@ -62,6 +65,12 @@ public:
     /// @brief 创建搜索器及其持久化置换表。
     /// @param transposition_table_mb 置换表目标容量，单位为 MB。
     explicit Searcher(std::size_t transposition_table_mb = 16);
+
+    /// @brief 创建使用指定评估器的搜索器及其持久化置换表。
+    /// @param evaluator 搜索叶子节点所使用的评估器；它必须比搜索器存活更久。
+    /// @param transposition_table_mb 置换表目标容量，单位为 MB。
+    explicit Searcher(const Evaluator& evaluator,
+                      std::size_t transposition_table_mb = 16);
 
     /// @brief 清空搜索器持有的全部置换表缓存。
     void clear_transposition_table();
@@ -81,12 +90,14 @@ public:
     [[nodiscard]] SearchResult search(GameHistory& history, const SearchLimits& limits);
 
 private:
+    const Evaluator& evaluator_;
     std::uint64_t nodes_{0};
     std::uint64_t beta_cutoffs_{0};
     std::uint64_t quiescence_nodes_{0};
     std::uint64_t tt_hits_{0};
     std::uint64_t tt_cutoffs_{0};
     std::uint64_t tt_move_orderings_{0};
+    std::uint64_t pvs_researches_{0};
     int quiescence_depth_{32};
     bool use_transposition_table_{true};
     TranspositionTable transposition_table_;
@@ -110,13 +121,13 @@ private:
     /// @return 当前行棋方视角的节点分数。
     int negamax(GameHistory& history, int depth, int ply);
 
-    /// @brief 递归执行带 Alpha-Beta 剪枝的 Negamax 搜索。
+    /// @brief 递归执行 PVS 优化的 Alpha-Beta Negamax 搜索。
     /// @param history 当前节点的局面与完整搜索路径。
     /// @param depth 当前节点剩余搜索深度。
     /// @param alpha 当前行棋方已经保证可以得到的分数下界。
     /// @param beta 对手允许当前行棋方得到的分数上界。
     /// @param ply 当前节点距离根节点的半回合数，用于偏好更快将死。
-    /// @return 当前行棋方视角的节点分数。
+    /// @return 当前行棋方视角的节点分数；零窗口节点可能返回边界值。
     int alpha_beta(GameHistory& history, int depth, int alpha, int beta, int ply);
 
     /// @brief 延伸搜索叶子节点中的吃子序列与被将军时的全部应将。

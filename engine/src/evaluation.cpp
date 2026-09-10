@@ -80,7 +80,11 @@ int piece_base_value(PieceType type) {
     return 0;
 }
 
-EvaluationBreakdown evaluate_breakdown(const Position& position) {
+std::string_view HandcraftedEvaluator::name() const noexcept {
+    return "handcrafted";
+}
+
+EvaluationBreakdown HandcraftedEvaluator::breakdown(const Position& position) const {
     EvaluationBreakdown result;
     for (int square = 0; square < kBoardSize; ++square) {
         const Piece piece = position.piece_at(square);
@@ -95,13 +99,27 @@ EvaluationBreakdown evaluate_breakdown(const Position& position) {
     return result;
 }
 
-int evaluate_for(const Position& position, Color perspective) {
-    const int red_score = evaluate_breakdown(position).total();
+int HandcraftedEvaluator::evaluate_for(
+    const Position& position, Color perspective) const {
+    const int red_score = breakdown(position).total();
     return perspective == Color::Red ? red_score : -red_score;
 }
 
+const HandcraftedEvaluator& handcrafted_evaluator() {
+    static const HandcraftedEvaluator evaluator;
+    return evaluator;
+}
+
+EvaluationBreakdown evaluate_breakdown(const Position& position) {
+    return handcrafted_evaluator().breakdown(position);
+}
+
+int evaluate_for(const Position& position, Color perspective) {
+    return handcrafted_evaluator().evaluate_for(position, perspective);
+}
+
 int evaluate(const Position& position) {
-    return evaluate_for(position, position.side_to_move());
+    return handcrafted_evaluator().evaluate(position);
 }
 
 }  // namespace xiangqi
