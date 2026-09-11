@@ -41,17 +41,21 @@ int orient_square_for_halfka(int square, Color perspective) {
 HalfKAFeatureIndex halfka_feature_index(
     const Position& position, Color perspective, int piece_square) {
     const Piece piece = position.piece_at(piece_square);
-    if (is_empty(piece)) {
+    return halfka_feature_index(
+        position.king_square(perspective), perspective, piece, piece_square);
+}
+
+HalfKAFeatureIndex halfka_feature_index(
+    int perspective_king_square, Color perspective,
+    Piece piece, int piece_square) {
+    if (is_empty(piece) || piece_type(piece) == PieceType::Empty) {
         throw std::invalid_argument("cannot encode an empty HalfKA feature");
     }
-
-    const int king_square = position.king_square(perspective);
-    if (king_square == kNoSquare) {
+    if (perspective_king_square == kNoSquare) {
         throw std::invalid_argument("HalfKA perspective king is missing");
     }
-
     const std::size_t bucket = king_bucket(
-        orient_square_for_halfka(king_square, perspective));
+        orient_square_for_halfka(perspective_king_square, perspective));
     const std::size_t channel = piece_channel(piece, perspective);
     const std::size_t square = static_cast<std::size_t>(
         orient_square_for_halfka(piece_square, perspective));

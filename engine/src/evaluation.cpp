@@ -2,9 +2,32 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
+#include <stdexcept>
 
 namespace xiangqi {
 namespace {
+
+/// @brief 为不需要增量缓存的评估器提供搜索状态适配。
+class StatelessEvaluationState final : public EvaluationState {
+public:
+    /// @brief 创建转发到指定评估器的无状态搜索上下文。
+    /// @param evaluator 必须比该搜索上下文存活更久的评估器。
+    explicit StatelessEvaluationState(const Evaluator& evaluator)
+        : evaluator_(evaluator) {}
+
+    void push_move(const Position&, Move, Piece, Piece) override {}
+
+    void pop_move() override {}
+
+    [[nodiscard]] int evaluate_for(
+        const Position& position, Color perspective) const override {
+        return evaluator_.evaluate_for(position, perspective);
+    }
+
+private:
+    const Evaluator& evaluator_;
+};
 
 /// @brief 计算棋子所在列靠近棋盘中心的程度。
 /// @param col 内部列号，范围为 0～8。
@@ -64,6 +87,11 @@ int positional_bonus(Piece piece, int square) {
 }
 
 }  // namespace
+
+std::unique_ptr<EvaluationState> Evaluator::create_state(
+    const Position&) const {
+    return std::make_unique<StatelessEvaluationState>(*this);
+}
 
 int piece_base_value(PieceType type) {
     switch (type) {

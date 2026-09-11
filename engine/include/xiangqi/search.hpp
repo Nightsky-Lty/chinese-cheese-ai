@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -91,6 +92,7 @@ public:
 
 private:
     const Evaluator& evaluator_;
+    std::unique_ptr<EvaluationState> evaluation_state_;
     std::uint64_t nodes_{0};
     std::uint64_t beta_cutoffs_{0};
     std::uint64_t quiescence_nodes_{0};
@@ -103,6 +105,16 @@ private:
     TranspositionTable transposition_table_;
     MoveOrdering move_ordering_;
     std::optional<int> cached_quiescence_depth_{};
+
+    /// @brief 同步执行搜索走法并更新对局历史与评估状态。
+    /// @param history 当前搜索路径。
+    /// @param move 已由合法走法生成器产生的走法。
+    void push_search_move(GameHistory& history, Move move);
+
+    /// @brief 同步撤销最近一步搜索走法及其评估状态。
+    /// @param history 当前搜索路径。
+    /// @throws std::logic_error 搜索路径没有可撤销走法时抛出。
+    void pop_search_move(GameHistory& history);
 
     /// @brief 执行迭代加深中的一个固定深度根节点搜索。
     /// @param history 待搜索对局；返回前会被完整恢复。

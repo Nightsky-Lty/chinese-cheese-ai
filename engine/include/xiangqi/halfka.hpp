@@ -36,6 +36,18 @@ using HalfKAInput = std::array<std::vector<HalfKAFeatureIndex>, 2>;
 [[nodiscard]] HalfKAFeatureIndex halfka_feature_index(
     const Position& position, Color perspective, int piece_square);
 
+/// @brief 使用显式棋子和将帅位置计算 HalfKA 特征编号。
+/// @param perspective_king_square 观察方将帅的原始棋盘位置。
+/// @param perspective 当前特征累加器所属的观察方。
+/// @param piece 要编码的非空棋子。
+/// @param piece_square 该棋子所在的原始棋盘位置。
+/// @return 范围为 `[0, kHalfKAFeatureDimensions)` 的唯一特征编号。
+/// @throws std::out_of_range 任一位置越界时抛出。
+/// @throws std::invalid_argument 棋子为空或观察方将帅不在己方九宫时抛出。
+[[nodiscard]] HalfKAFeatureIndex halfka_feature_index(
+    int perspective_king_square, Color perspective,
+    Piece piece, int piece_square);
+
 /// @brief 提取一个视角下当前局面所有激活的 HalfKA 稀疏特征。
 /// @param position 要编码的有效象棋局面。
 /// @param perspective 当前特征累加器所属的观察方。

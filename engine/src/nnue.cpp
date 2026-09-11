@@ -179,18 +179,47 @@ NnueAccumulator NnueNetwork::refresh_accumulator(
     const std::vector<HalfKAFeatureIndex> features =
         active_halfka_features(position, perspective);
     for (HalfKAFeatureIndex feature : features) {
-        const std::size_t offset = feature * kNnueAccumulatorSize;
-        for (std::size_t neuron = 0; neuron < kNnueAccumulatorSize; ++neuron) {
-            accumulator[neuron] += feature_weights_[offset + neuron];
-        }
+        add_feature(accumulator, feature);
     }
     return accumulator;
 }
 
+void NnueNetwork::add_feature(
+    NnueAccumulator& accumulator, HalfKAFeatureIndex feature) const {
+    if (feature >= kHalfKAFeatureDimensions) {
+        throw std::out_of_range("NNUE feature index outside network input");
+    }
+    const std::size_t offset = feature * kNnueAccumulatorSize;
+    for (std::size_t neuron = 0; neuron < kNnueAccumulatorSize; ++neuron) {
+        accumulator[neuron] += feature_weights_[offset + neuron];
+    }
+}
+
+void NnueNetwork::remove_feature(
+    NnueAccumulator& accumulator, HalfKAFeatureIndex feature) const {
+    if (feature >= kHalfKAFeatureDimensions) {
+        throw std::out_of_range("NNUE feature index outside network input");
+    }
+    const std::size_t offset = feature * kNnueAccumulatorSize;
+    for (std::size_t neuron = 0; neuron < kNnueAccumulatorSize; ++neuron) {
+        accumulator[neuron] -= feature_weights_[offset + neuron];
+    }
+}
+
 float NnueNetwork::forward(const Position& position, Color perspective) const {
-    const NnueAccumulator own = refresh_accumulator(position, perspective);
-    const NnueAccumulator opponent =
-        refresh_accumulator(position, opposite(perspective));
+    const NnueAccumulator red = refresh_accumulator(position, Color::Red);
+    const NnueAccumulator black = refresh_accumulator(position, Color::Black);
+    return forward_from_accumulators(red, black, perspective);
+}
+
+float NnueNetwork::forward_from_accumulators(
+    const NnueAccumulator& red_accumulator,
+    const NnueAccumulator& black_accumulator,
+    Color perspective) const {
+    const NnueAccumulator& own =
+        perspective == Color::Red ? red_accumulator : black_accumulator;
+    const NnueAccumulator& opponent =
+        perspective == Color::Red ? black_accumulator : red_accumulator;
 
     std::array<float, kNnueConcatenatedSize> input{};
     for (std::size_t neuron = 0; neuron < kNnueAccumulatorSize; ++neuron) {
@@ -217,7 +246,17 @@ float NnueNetwork::forward(const Position& position, Color perspective) const {
 }
 
 int NnueNetwork::evaluate(const Position& position, Color perspective) const {
-    const float output = forward(position, perspective);
+    const NnueAccumulator red = refresh_accumulator(position, Color::Red);
+    const NnueAccumulator black = refresh_accumulator(position, Color::Black);
+    return evaluate_from_accumulators(red, black, perspective);
+}
+
+int NnueNetwork::evaluate_from_accumulators(
+    const NnueAccumulator& red_accumulator,
+    const NnueAccumulator& black_accumulator,
+    Color perspective) const {
+    const float output = forward_from_accumulators(
+        red_accumulator, black_accumulator, perspective);
     if (!std::isfinite(output)) {
         throw std::runtime_error("NNUE inference produced a non-finite score");
     }
@@ -287,6 +326,84 @@ void NnueNetwork::validate_finite() const {
     }
 }
 
+NnueEvaluationState::NnueEvaluationState(
+    const NnueNetwork& network, const Position& root_position)
+    : network_(network),
+      accumulators_{
+          network.refresh_accumulator(root_position, Color::Red),
+          network.refresh_accumulator(root_position, Color::Black),
+      },
+      position_hash_(root_position.hash()) {}
+
+void NnueEvaluationState::push_move(
+    const Position& position_after, Move move, Piece moved, Piece captured) {
+    if (is_empty(moved) || move.from >= kBoardSize || move.to >= kBoardSize ||
+        !is_empty(position_after.piece_at(move.from)) ||
+        position_after.piece_at(move.to) != moved) {
+        throw std::invalid_argument("invalid move metadata for NNUE accumulator update");
+    }
+
+    stack_.push_back(Snapshot{accumulators_, position_hash_});
+    try {
+        const Color mover = piece_color(moved);
+        for (Color perspective : {Color::Red, Color::Black}) {
+            const std::size_t index = static_cast<std::size_t>(perspective);
+            if (piece_type(moved) == PieceType::King && mover == perspective) {
+                accumulators_[index] =
+                    network_.refresh_accumulator(position_after, perspective);
+                continue;
+            }
+
+            const int king_square = position_after.king_square(perspective);
+            network_.remove_feature(
+                accumulators_[index],
+                halfka_feature_index(
+                    king_square, perspective, moved, move.from));
+            if (!is_empty(captured)) {
+                network_.remove_feature(
+                    accumulators_[index],
+                    halfka_feature_index(
+                        king_square, perspective, captured, move.to));
+            }
+            network_.add_feature(
+                accumulators_[index],
+                halfka_feature_index(
+                    king_square, perspective, moved, move.to));
+        }
+        position_hash_ = position_after.hash();
+    } catch (...) {
+        accumulators_ = stack_.back().accumulators;
+        position_hash_ = stack_.back().position_hash;
+        stack_.pop_back();
+        throw;
+    }
+}
+
+void NnueEvaluationState::pop_move() {
+    if (stack_.empty()) {
+        throw std::logic_error("cannot pop the root NNUE accumulator state");
+    }
+    accumulators_ = stack_.back().accumulators;
+    position_hash_ = stack_.back().position_hash;
+    stack_.pop_back();
+}
+
+int NnueEvaluationState::evaluate_for(
+    const Position& position, Color perspective) const {
+    if (position.hash() != position_hash_) {
+        throw std::logic_error("NNUE accumulator is out of sync with position");
+    }
+    return network_.evaluate_from_accumulators(
+        accumulators_[static_cast<std::size_t>(Color::Red)],
+        accumulators_[static_cast<std::size_t>(Color::Black)],
+        perspective);
+}
+
+const NnueAccumulator& NnueEvaluationState::accumulator(
+    Color perspective) const {
+    return accumulators_[static_cast<std::size_t>(perspective)];
+}
+
 NnueEvaluator::NnueEvaluator(NnueNetwork network)
     : network_(std::move(network)) {}
 
@@ -300,6 +417,11 @@ std::string_view NnueEvaluator::name() const noexcept {
 int NnueEvaluator::evaluate_for(
     const Position& position, Color perspective) const {
     return network_.evaluate(position, perspective);
+}
+
+std::unique_ptr<EvaluationState> NnueEvaluator::create_state(
+    const Position& position) const {
+    return std::make_unique<NnueEvaluationState>(network_, position);
 }
 
 }  // namespace xiangqi

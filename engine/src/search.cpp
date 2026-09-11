@@ -54,6 +54,11 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
         throw std::invalid_argument("quiescence depth cannot be negative");
     }
 
+    evaluation_state_ = evaluator_.create_state(history.position_);
+    if (!evaluation_state_) {
+        throw std::logic_error("evaluator returned a null search state");
+    }
+
     nodes_ = 0;
     beta_cutoffs_ = 0;
     quiescence_nodes_ = 0;
@@ -150,6 +155,28 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
     return result;
 }
 
+void Searcher::push_search_move(GameHistory& history, Move move) {
+    history.push_legal_move(move);
+    const HistoryEntry& entry = history.entries_.back();
+    try {
+        evaluation_state_->push_move(
+            history.position_, move, entry.moved, entry.captured);
+    } catch (...) {
+        static_cast<void>(history.undo_last());
+        throw;
+    }
+}
+
+void Searcher::pop_search_move(GameHistory& history) {
+    if (!history.can_undo()) {
+        throw std::logic_error("cannot pop an empty search path");
+    }
+    evaluation_state_->pop_move();
+    if (!history.undo_last()) {
+        throw std::logic_error("failed to undo synchronized search move");
+    }
+}
+
 SearchResult Searcher::search_iteration(GameHistory& history, int depth,
                                         SearchAlgorithm algorithm,
                                         std::optional<Move> previous_best) {
@@ -197,7 +224,7 @@ SearchResult Searcher::search_iteration(GameHistory& history, int depth,
 
     bool first_move = true;
     for (Move move : moves) {
-        history.push_legal_move(move);
+        push_search_move(history, move);
         int score = 0;
         if (algorithm == SearchAlgorithm::Negamax) {
             score = -negamax(history, depth - 1, 1);
@@ -212,7 +239,7 @@ SearchResult Searcher::search_iteration(GameHistory& history, int depth,
                 score = -alpha_beta(history, depth - 1, -beta, -alpha, 1);
             }
         }
-        static_cast<void>(history.undo_last());
+        pop_search_move(history);
 
         if (score > best_score) {
             best_score = score;
@@ -252,9 +279,9 @@ int Searcher::negamax(GameHistory& history, int depth, int ply) {
                                previous_move_info(history));
     int best_score = -kSearchInfinity;
     for (Move move : moves) {
-        history.push_legal_move(move);
+        push_search_move(history, move);
         const int score = -negamax(history, depth - 1, ply + 1);
-        static_cast<void>(history.undo_last());
+        pop_search_move(history);
         best_score = std::max(best_score, score);
     }
     return best_score;
@@ -303,7 +330,7 @@ int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, i
     bool first_move = true;
     for (Move move : moves) {
         const bool quiet = is_empty(position.piece_at(move.to));
-        history.push_legal_move(move);
+        push_search_move(history, move);
         int score = 0;
         if (first_move) {
             score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
@@ -314,7 +341,7 @@ int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, i
                 score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
             }
         }
-        static_cast<void>(history.undo_last());
+        pop_search_move(history);
 
         if (score > best_score) {
             best_score = score;
@@ -362,7 +389,7 @@ int Searcher::quiescence(GameHistory& history, int alpha, int beta, int ply, int
         return *score;
     }
 
-    const int stand_pat = evaluator_.evaluate(position);
+    const int stand_pat = evaluation_state_->evaluate(position);
     if (qply >= quiescence_depth_) {
         return stand_pat;
     }
@@ -390,10 +417,10 @@ int Searcher::quiescence(GameHistory& history, int alpha, int beta, int ply, int
                                previous_move_info(history));
     int best_score = checked ? -kSearchInfinity : stand_pat;
     for (Move move : moves) {
-        history.push_legal_move(move);
+        push_search_move(history, move);
         ++nodes_;
         const int score = -quiescence(history, -beta, -alpha, ply + 1, qply + 1);
-        static_cast<void>(history.undo_last());
+        pop_search_move(history);
 
         best_score = std::max(best_score, score);
         alpha = std::max(alpha, score);

@@ -3,6 +3,7 @@
 #include "xiangqi/position.hpp"
 
 #include <array>
+#include <memory>
 #include <string_view>
 
 namespace xiangqi {
@@ -15,6 +16,40 @@ struct EvaluationBreakdown {
     /// @brief 计算红方视角的总评估分。
     /// @return `material + positional`；正数表示红方有利。
     [[nodiscard]] int total() const { return material + positional; }
+};
+
+/// @brief 保存一次搜索路径独有的评估状态。
+///
+/// 手工评估实现可以忽略走子通知；NNUE 实现利用这些通知增量维护第一层累加器。
+class EvaluationState {
+public:
+    virtual ~EvaluationState() = default;
+
+    /// @brief 通知评估状态棋盘已经执行了一步棋。
+    /// @param position_after 执行走法后的局面。
+    /// @param move 刚执行的走法。
+    /// @param moved 从起点移动的非空棋子编码。
+    /// @param captured 目标位置原有的棋子；未吃子时为 `kEmpty`。
+    virtual void push_move(const Position& position_after, Move move,
+                           Piece moved, Piece captured) = 0;
+
+    /// @brief 撤销最后一次 `push_move` 对评估状态造成的改变。
+    /// @throws std::logic_error 没有可撤销状态时抛出。
+    virtual void pop_move() = 0;
+
+    /// @brief 从指定阵营视角评估当前搜索局面。
+    /// @param position 当前棋盘，用于无状态评估或检查状态同步。
+    /// @param perspective 评分所站的阵营。
+    /// @return 正数表示 `perspective` 有利，负数表示其不利。
+    [[nodiscard]] virtual int evaluate_for(
+        const Position& position, Color perspective) const = 0;
+
+    /// @brief 从当前行棋方视角评估局面。
+    /// @param position 当前搜索局面。
+    /// @return 正数表示当前行棋方有利，负数表示其不利。
+    [[nodiscard]] int evaluate(const Position& position) const {
+        return evaluate_for(position, position.side_to_move());
+    }
 };
 
 /// @brief 定义搜索器可使用的统一局面评估接口。
@@ -33,6 +68,12 @@ public:
     /// @return 正数表示 `perspective` 有利，负数表示其不利。
     [[nodiscard]] virtual int evaluate_for(
         const Position& position, Color perspective) const = 0;
+
+    /// @brief 为一条新的搜索路径创建独立评估状态。
+    /// @param position 搜索开始时的根局面。
+    /// @return 与根局面同步的评估状态；默认实现转发到无状态 `evaluate_for`。
+    [[nodiscard]] virtual std::unique_ptr<EvaluationState> create_state(
+        const Position& position) const;
 
     /// @brief 从当前行棋方视角评估局面，供 Negamax 搜索直接调用。
     /// @param position 待评估的非终局局面。

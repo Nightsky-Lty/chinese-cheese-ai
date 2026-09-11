@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -43,6 +44,25 @@ Move move(const std::string& text) {
 
 bool contains(const std::vector<Move>& moves, const std::string& text) {
     return std::find(moves.begin(), moves.end(), move(text)) != moves.end();
+}
+
+bool nnue_accumulators_match_refresh(
+    const xiangqi::NnueNetwork& network,
+    const xiangqi::NnueEvaluationState& state,
+    const Position& position) {
+    for (Color perspective : {Color::Red, Color::Black}) {
+        const xiangqi::NnueAccumulator refreshed =
+            network.refresh_accumulator(position, perspective);
+        const xiangqi::NnueAccumulator& incremental =
+            state.accumulator(perspective);
+        for (std::size_t neuron = 0;
+             neuron < xiangqi::kNnueAccumulatorSize; ++neuron) {
+            if (std::abs(refreshed[neuron] - incremental[neuron]) >= 0.0001F) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void test_initial_position() {
@@ -560,6 +580,173 @@ void test_nnue_accumulator_and_forward_inference() {
     network.feature_biases()[0] = 10.0F;
     expect(std::abs(network.forward(position, Color::Red) - 101.4F) < 0.0001F,
            "NNUE feature-transform activation is clipped to one");
+}
+
+void test_nnue_incremental_accumulator_updates() {
+    xiangqi::NnueNetwork network;
+    for (std::size_t feature = 0;
+         feature < xiangqi::kHalfKAFeatureDimensions; ++feature) {
+        for (std::size_t neuron = 0; neuron < 4; ++neuron) {
+            const int pattern = static_cast<int>((feature + neuron * 7U) % 23U) - 11;
+            network.feature_weights()[
+                feature * xiangqi::kNnueAccumulatorSize + neuron] =
+                static_cast<float>(pattern) * 0.003F;
+        }
+    }
+
+    Position position = Position::from_fen(
+        "4k4/9/9/9/4p4/9/9/4R4/9/4K4 w");
+    xiangqi::NnueEvaluationState state(network, position);
+
+    const auto exercise_move = [&](const std::string& text,
+                                   const std::string& description) {
+        const Move candidate = move(text);
+        const Position before = position;
+        const xiangqi::NnueAccumulator red_before = state.accumulator(Color::Red);
+        const xiangqi::NnueAccumulator black_before = state.accumulator(Color::Black);
+        const xiangqi::Piece moved = position.piece_at(candidate.from);
+        const xiangqi::Piece captured = position.piece_at(candidate.to);
+        const xiangqi::UndoInfo undo = position.do_move(candidate);
+        state.push_move(position, candidate, moved, captured);
+
+        expect(nnue_accumulators_match_refresh(network, state, position),
+               description + " incremental update matches refresh");
+        expect(state.stack_size() == 1,
+               description + " stores one accumulator undo snapshot");
+
+        state.pop_move();
+        position.undo_move(candidate, undo);
+        expect(position == before &&
+                   state.accumulator(Color::Red) == red_before &&
+                   state.accumulator(Color::Black) == black_before &&
+                   state.stack_size() == 0,
+               description + " pop restores the exact root state");
+        expect(state.evaluate_for(position, Color::Red) ==
+                   network.evaluate(position, Color::Red),
+               description + " restored state remains synchronized");
+    };
+
+    exercise_move("e2d2", "quiet rook move");
+    exercise_move("e2e5", "rook capture");
+    exercise_move("e0d0", "king move with own-perspective refresh");
+
+    struct PlayedMove {
+        Move move{};
+        xiangqi::UndoInfo undo{};
+    };
+    Position line = Position::initial();
+    const Position line_root = line;
+    xiangqi::NnueEvaluationState line_state(network, line);
+    std::vector<PlayedMove> played;
+    for (std::size_t ply = 0; ply < 24; ++ply) {
+        std::vector<Move> moves = line.generate_legal_moves();
+        if (moves.empty()) {
+            break;
+        }
+        const Move candidate = moves[(ply * 17U + 3U) % moves.size()];
+        const xiangqi::Piece moved = line.piece_at(candidate.from);
+        const xiangqi::Piece captured = line.piece_at(candidate.to);
+        const xiangqi::UndoInfo undo = line.do_move(candidate);
+        line_state.push_move(line, candidate, moved, captured);
+        played.push_back(PlayedMove{candidate, undo});
+        expect(nnue_accumulators_match_refresh(network, line_state, line),
+               "multi-ply incremental accumulators match a full refresh");
+    }
+    while (!played.empty()) {
+        const PlayedMove last = played.back();
+        played.pop_back();
+        line_state.pop_move();
+        line.undo_move(last.move, last.undo);
+        expect(nnue_accumulators_match_refresh(network, line_state, line),
+               "multi-ply accumulator undo matches a full refresh");
+    }
+    expect(line == line_root && line_state.stack_size() == 0,
+           "multi-ply accumulator stack returns exactly to its root");
+
+    const Position search_root = position;
+    xiangqi::NnueEvaluator evaluator(std::move(network));
+    xiangqi::Searcher searcher(evaluator);
+    const xiangqi::SearchResult result = searcher.search(
+        position,
+        xiangqi::SearchLimits{.depth = 2,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta,
+                              .quiescence_depth = 0,
+                              .use_transposition_table = false});
+    expect(result.best_move.has_value(),
+           "search can traverse multiple plies with incremental NNUE state");
+    expect(position == search_root,
+           "incremental NNUE search restores its root position");
+}
+
+void test_search_maintains_evaluation_state() {
+    struct Counters {
+        int pushes{0};
+        int pops{0};
+        int evaluations{0};
+    };
+
+    class TrackingState final : public xiangqi::EvaluationState {
+    public:
+        explicit TrackingState(Counters& counters) : counters_(counters) {}
+
+        void push_move(const Position&, Move, xiangqi::Piece,
+                       xiangqi::Piece) override {
+            ++counters_.pushes;
+        }
+
+        void pop_move() override {
+            ++counters_.pops;
+        }
+
+        [[nodiscard]] int evaluate_for(
+            const Position&, Color) const override {
+            ++counters_.evaluations;
+            return 0;
+        }
+
+    private:
+        Counters& counters_;
+    };
+
+    class TrackingEvaluator final : public xiangqi::Evaluator {
+    public:
+        explicit TrackingEvaluator(Counters& counters) : counters_(counters) {}
+
+        [[nodiscard]] std::string_view name() const noexcept override {
+            return "tracking-test";
+        }
+
+        [[nodiscard]] int evaluate_for(const Position&, Color) const override {
+            return 0;
+        }
+
+        [[nodiscard]] std::unique_ptr<xiangqi::EvaluationState> create_state(
+            const Position&) const override {
+            return std::make_unique<TrackingState>(counters_);
+        }
+
+    private:
+        Counters& counters_;
+    };
+
+    Counters counters;
+    TrackingEvaluator evaluator(counters);
+    Position position = Position::initial();
+    const Position original = position;
+    xiangqi::Searcher searcher(evaluator);
+    static_cast<void>(searcher.search(
+        position,
+        xiangqi::SearchLimits{.depth = 2,
+                              .algorithm = xiangqi::SearchAlgorithm::AlphaBeta,
+                              .quiescence_depth = 0,
+                              .use_transposition_table = false}));
+
+    expect(counters.pushes > 0 && counters.pushes == counters.pops,
+           "Searcher balances every evaluation-state push with a pop");
+    expect(counters.evaluations > 0,
+           "Searcher evaluates leaves through its search-specific state");
+    expect(position == original,
+           "evaluation-state maintenance preserves the root position");
 }
 
 void test_nnue_file_round_trip_and_search() {
@@ -1093,6 +1280,8 @@ int main() {
     test_evaluation_symmetry_and_material();
     test_evaluator_interface_and_search_injection();
     test_nnue_accumulator_and_forward_inference();
+    test_nnue_incremental_accumulator_updates();
+    test_search_maintains_evaluation_state();
     test_nnue_file_round_trip_and_search();
     test_advanced_pawn_value();
     test_piece_base_values();
