@@ -8,7 +8,7 @@ ENGINE_SOURCE := engine/src/position.cpp engine/src/game_history.cpp engine/src/
 CLI_SOURCE := engine/src/main.cpp
 TEST_SOURCE := engine/tests/rules_tests.cpp
 
-.PHONY: all test run clean
+.PHONY: all test python-test run clean
 
 all: $(BUILD_DIR)/xiangqi_cli $(BUILD_DIR)/xiangqi_rules_tests
 
@@ -23,6 +23,9 @@ $(BUILD_DIR)/xiangqi_rules_tests: $(ENGINE_SOURCE) $(TEST_SOURCE) | $(BUILD_DIR)
 
 test: $(BUILD_DIR)/xiangqi_rules_tests
 	./$(BUILD_DIR)/xiangqi_rules_tests
+
+python-test: $(BUILD_DIR)/xiangqi_cli
+	python3 -m unittest discover -s training/tests -v
 
 run: $(BUILD_DIR)/xiangqi_cli
 	./$(BUILD_DIR)/xiangqi_cli

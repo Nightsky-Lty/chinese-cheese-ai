@@ -12,3 +12,10 @@
 .DS_Store
 *.swp
 *.swo
+
+# Python training artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+/training/runs/

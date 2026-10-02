@@ -5,6 +5,7 @@
 
 #include <exception>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -16,6 +17,7 @@ int main(int argc, char** argv) {
         int search_depth = 0;
         xiangqi::SearchAlgorithm algorithm = xiangqi::SearchAlgorithm::AlphaBeta;
         std::optional<std::filesystem::path> nnue_path;
+        bool print_nnue_raw = false;
         for (int index = 1; index < argc; ++index) {
             const std::string argument = argv[index];
             if (argument == "--fen" && index + 1 < argc) {
@@ -26,6 +28,8 @@ int main(int argc, char** argv) {
                 algorithm = xiangqi::SearchAlgorithm::Negamax;
             } else if (argument == "--nnue" && index + 1 < argc) {
                 nnue_path = argv[++index];
+            } else if (argument == "--nnue-raw") {
+                print_nnue_raw = true;
             } else {
                 throw std::invalid_argument("unknown or incomplete command-line option: " + argument);
             }
@@ -36,6 +40,8 @@ int main(int argc, char** argv) {
         if (nnue_path) {
             nnue_evaluator.emplace(*nnue_path);
             evaluator = &*nnue_evaluator;
+        } else if (print_nnue_raw) {
+            throw std::invalid_argument("--nnue-raw requires --nnue MODEL");
         }
 
         std::cout << position.pretty();
@@ -48,6 +54,12 @@ int main(int argc, char** argv) {
                       << ", positional(red-black): " << evaluation.positional << ']';
         }
         std::cout << '\n';
+        if (print_nnue_raw) {
+            std::cout << "nnue raw: " << std::setprecision(9)
+                      << nnue_evaluator->network().forward(
+                             position, position.side_to_move())
+                      << '\n';
+        }
         const auto moves = position.generate_legal_moves();
         std::cout << "legal moves: " << moves.size() << '\n';
         for (xiangqi::Move move : moves) {

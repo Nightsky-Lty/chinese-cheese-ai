@@ -10,8 +10,8 @@
 
 > 当前状态：规则引擎、手工评估、Negamax、Alpha-Beta/PVS、静态搜索、迭代加深、
 > 置换表、“三次重复、长将、长捉、无吃子”的简化裁决，以及 float32 NNUE
-> 前向推理与搜索内增量累加器均已实现；训练流水线、量化优化和 GUI 自动操作
-> 尚未实现。
+> 前向推理、搜索内增量累加器和 Python 监督训练/导出流水线均已实现；自我对弈
+> 数据生成、量化优化和 GUI 自动操作尚未实现。
 
 ## 项目结构
 
@@ -32,6 +32,14 @@ chinese-cheese-ai/
 │   ├── src/                          # 各模块的 C++ 实现和命令行程序
 │   └── tests/
 │       └── rules_tests.cpp           # 规则、历史、评估和搜索测试
+├── training/
+│   ├── halfka.py                     # 与 C++ 一致的 HalfKA 特征编码
+│   ├── model.py                      # PyTorch NNUE 网络与稀疏批处理
+│   ├── dataset.py                    # JSONL 训练样本加载
+│   ├── train.py                      # 训练、验证、检查点和续训
+│   ├── export_nnue.py                # 导出 XQNNUEF1 权重
+│   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
+│   └── tests/                        # Python 训练端自动测试
 ├── .vscode/                          # VS Code 构建、测试和调试配置
 ├── CMakeLists.txt                    # CMake 构建配置
 ├── Makefile                          # Make 构建配置
@@ -158,7 +166,26 @@ HalfKA 特征的将帅桶，因此只全量刷新该方累加器。每层搜索�
 走法时精确恢复。叶子节点直接从缓存的两个累加器执行 `512→32→1`，不再扫描棋盘
 调用 `refresh_accumulator()`。
 
-### 5. Negamax 与 Alpha-Beta/PVS 搜索
+### 5. Python NNUE 训练端
+
+Python 使用 PyTorch 描述与 C++ 完全相同的网络。批处理只保存每个局面的激活特征
+编号并对相应权重行求和，不会构造 `batch × 11340` 的稠密输入。训练样本采用
+JSON Lines，每行至少包含 FEN 和当前行棋方视角的引擎分值：
+
+```json
+{"fen":"4k4/9/9/9/4p4/9/9/4R4/9/4K4 w","score":780,"weight":1.5}
+```
+
+`score` 会被限制到 ±28000；可选的正数 `weight` 用于调整单条样本的损失权重。
+训练使用带样本权重的 Smooth L1 损失和 AdamW，检查点保存模型、优化器、轮次、
+验证损失及架构元数据。导出器只提取推理参数，并按 C++ 已实现的 `XQNNUEF1`
+小端格式写出。
+
+`verify_cpp.py` 会临时导出模型，针对相同 FEN 分别执行 PyTorch 和 C++ 原始
+float32 前向传播，然后检查误差是否在容差内。这可以尽早发现特征方向、矩阵转置、
+拼接顺序或权重排列不一致的问题。
+
+### 6. Negamax 与 Alpha-Beta/PVS 搜索
 
 双方对称的零和搜索被写成 Negamax 形式：当前节点的分数等于对手子节点分数的
 相反数。在此基础上使用 Alpha-Beta 窗口剪掉不可能影响最终选择的分支。
@@ -171,13 +198,13 @@ Alpha-Beta 路线进一步使用 PVS：排序后的第一候选着以完整窗�
 仓库同时保留无剪枝 Negamax，便于对照验证 Alpha-Beta 的结果是否正确。搜索器
 还会统计主搜索节点、静态搜索节点、剪枝次数和置换表命中次数。
 
-### 6. 静态搜索
+### 7. 静态搜索
 
 固定深度搜索如果正好停在一次交换中间，评估会产生明显波动。静态搜索会在叶子
 节点继续搜索吃子着，直到局面相对稳定；如果当前正被将军，则搜索全部合法应将，
 避免直接评估一个尚未处理的将军局面。
 
-### 7. 迭代加深与置换表
+### 8. 迭代加深与置换表
 
 迭代加深依次搜索深度 1、2、3……，每完成一层就保留该层的最佳着法、评分和
 统计信息。这为后续加入限时搜索打下基础，也能为更深一层提供较好的着法顺序。
@@ -253,6 +280,9 @@ MVV-LVA 和 SEE 使用手工
 - [x] 将帅换桶刷新和普通走子/吃子差量更新
 - [x] 版本化小端 NNUE 权重加载与保存
 - [x] 可注入搜索器的 `NnueEvaluator`
+- [x] Python/PyTorch 同构 NNUE 网络和稀疏批处理
+- [x] JSONL 监督训练、验证、检查点和续训
+- [x] `XQNNUEF1` 权重导出与 Python/C++ 一致性验证
 - [x] 固定深度 Negamax
 - [x] Alpha-Beta 剪枝
 - [x] PVS 零窗口试探与必要的完整窗口重搜
@@ -272,6 +302,7 @@ MVV-LVA 和 SEE 使用手工
 - [x] 命令行局面展示与搜索演示
 - [x] VS Code 构建、测试和调试配置
 - [x] Perft、规则、历史裁决、评估和搜索自动测试
+- [x] Python 特征、反向传播、导出和跨语言推理测试
 
 ## 尚未实现
 
@@ -279,8 +310,7 @@ MVV-LVA 和 SEE 使用手工
 - [ ] 时间控制与可中断搜索
 - [ ] LMR、空步裁剪和期望窗口等搜索增强
 - [ ] NNUE SIMD 与整数量化优化
-- [ ] Python 自我对弈、数据生成和训练流水线
-- [ ] C++ 神经网络推理与模型加载
+- [ ] Python 自我对弈和大规模训练数据生成
 - [ ] UCCI 等标准引擎通信协议
 - [ ] 棋盘识别、落子和 GUI 控制适配层
 
@@ -308,6 +338,33 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+安装 Python 训练依赖并运行训练端测试：
+
+```bash
+python3 -m pip install -r training/requirements.txt
+make python-test
+```
+
+使用仓库中的微型示例验证训练闭环：
+
+```bash
+python3 -m training.train training/examples/tiny.jsonl \
+  --output-dir training/runs/example \
+  --epochs 1 \
+  --batch-size 2
+
+python3 -m training.export_nnue \
+  training/runs/example/best.pt \
+  training/runs/example/best.nnue
+
+python3 -m training.verify_cpp \
+  training/runs/example/best.pt \
+  --engine build/make/xiangqi_cli
+```
+
+示例数据只用于检查代码能否运行，不能训练出具有棋力的模型。`--resume` 可从
+`latest.pt` 继续训练；`--epochs` 表示续训后希望达到的总轮次。
+
 ## 命令行使用
 
 使用 Make 构建后，可以查看初始局面并列出合法走法：
@@ -332,6 +389,12 @@ ctest --test-dir build --output-on-failure
 
 ```bash
 ./build/make/xiangqi_cli --nnue model.nnue --depth 4
+```
+
+输出供跨语言验证使用的未取整 NNUE 分数：
+
+```bash
+./build/make/xiangqi_cli --nnue model.nnue --nnue-raw
 ```
 
 载入指定 FEN：
@@ -360,7 +423,7 @@ b0c2
 
 1. 用更多真实棋例校准长捉例外，并扩展“一将一捉”等复杂循环责任。
 2. 完善着法排序和搜索剪枝，并加入时间管理，形成稳定的传统引擎基线。
-3. 用 Python 建立自我对弈、棋谱解析、样本生成、训练和模型评估流程。
+3. 用 Python/C++ 建立自我对弈、棋谱解析和大规模样本生成流程。
 4. 对训练模型进行量化和 SIMD 推理优化，并通过对局评估棋力。
 5. 定义稳定的引擎通信接口，再单独实现棋盘识别与 GUI 操作模块。
 
