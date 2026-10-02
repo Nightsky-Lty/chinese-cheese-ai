@@ -13,6 +13,12 @@ from training.checkpoint import load_model, save_checkpoint
 from training.dataset import JsonlPositionDataset, TrainingSample, collate_samples
 from training.export_nnue import HEADER, export_checkpoint
 from training.halfka import FEATURE_DIMENSIONS, encode_fen
+from training.iterate import (
+    STATE_FORMAT,
+    atomic_write_json,
+    load_state,
+    replay_datasets,
+)
 from training.model import (
     ACCUMULATOR_SIZE,
     HIDDEN_SIZE,
@@ -160,6 +166,47 @@ class CheckpointAndExportTests(unittest.TestCase):
                 expected = python_score(loaded, fen)
                 actual = cpp_score(engine, nnue_path, fen)
                 self.assertAlmostEqual(actual, expected, delta=1.0e-4)
+
+
+class IterationOrchestrationTests(unittest.TestCase):
+    def test_state_round_trip_and_replay_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            for generation in range(4):
+                generation_dir = work_dir / f"generation-{generation:03d}"
+                generation_dir.mkdir()
+                (generation_dir / "data.jsonl").write_text(
+                    json.dumps({"fen": INITIAL_FEN, "score": generation}) + "\n",
+                    encoding="utf-8",
+                )
+
+            state_path = work_dir / "state.json"
+            atomic_write_json(
+                state_path,
+                {
+                    "format": STATE_FORMAT,
+                    "completed_generation": 3,
+                    "champion_checkpoint": "/tmp/champion.pt",
+                    "champion_model": "/tmp/champion.nnue",
+                    "champion_epoch": 40,
+                },
+            )
+            state = load_state(state_path)
+            replay = replay_datasets(work_dir, generation=3, count=2)
+
+        self.assertEqual(state.completed_generation, 3)
+        self.assertEqual(state.champion_epoch, 40)
+        self.assertEqual(
+            [path.parent.name for path in replay],
+            ["generation-002", "generation-003"],
+        )
+
+    def test_invalid_iteration_state_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text('{"format":"unknown"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unsupported iteration state"):
+                load_state(state_path)
 
 
 if __name__ == "__main__":

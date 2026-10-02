@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .dataset import JsonlPositionDataset, TrainingSample, collate_samples
@@ -156,9 +156,19 @@ def parse_args() -> argparse.Namespace:
     """解析训练命令行参数并返回 argparse 命名空间。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("dataset", type=Path, help="JSONL file with fen and score fields")
+    parser.add_argument(
+        "dataset",
+        type=Path,
+        nargs="+",
+        help="one or more JSONL files with fen and score fields",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("training/runs/default"))
     parser.add_argument("--resume", type=Path, help="resume from a .pt checkpoint")
+    parser.add_argument(
+        "--reset-best",
+        action="store_true",
+        help="reset the best validation loss after loading a checkpoint",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
@@ -186,7 +196,13 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
-    dataset = JsonlPositionDataset(args.dataset, score_clip=args.score_clip)
+    datasets = [
+        JsonlPositionDataset(path, score_clip=args.score_clip)
+        for path in args.dataset
+    ]
+    dataset: Dataset[TrainingSample] = (
+        datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
+    )
     train_loader, validation_loader = make_loaders(
         dataset,
         args.batch_size,
@@ -211,6 +227,9 @@ def main() -> None:
         best_validation_loss = float(
             checkpoint.get("best_validation_loss", float("inf"))
         )
+        if args.reset_best:
+            # 新一代通常会更换回放数据集，旧验证损失不再具有可比性。
+            best_validation_loss = float("inf")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(
@@ -247,7 +266,13 @@ def main() -> None:
             "training_loss": training_loss,
             "validation_loss": validation_loss,
             "training_args": {
-                key: str(value) if isinstance(value, Path) else value
+                key: (
+                    [str(item) for item in value]
+                    if isinstance(value, list)
+                    else str(value)
+                    if isinstance(value, Path)
+                    else value
+                )
                 for key, value in vars(args).items()
             },
         }

@@ -10,8 +10,9 @@
 
 > 当前状态：规则引擎、手工评估、Negamax、Alpha-Beta/PVS、静态搜索、迭代加深、
 > 置换表、“三次重复、长将、长捉、无吃子”的简化裁决，以及 float32 NNUE
-> 前向推理、搜索内增量累加器和 Python 监督训练/导出流水线均已实现；自我对弈
-> 数据生成、量化优化和 GUI 自动操作尚未实现。
+> 前向推理、搜索内增量累加器、C++ 自我对弈数据生成和 Python 监督训练/导出
+> 流水线均已实现，并可自动连续执行多代训练；棋力对局晋升、大规模并行生成、
+> 量化优化和 GUI 自动操作尚未实现。
 
 ## 项目结构
 
@@ -28,6 +29,7 @@ chinese-cheese-ai/
 │   │   ├── move_ordering.hpp         # SEE、Killer、Counter 与多层 History 排序
 │   │   ├── nnue.hpp                  # NNUE 权重、加载、累加与推理
 │   │   ├── search.hpp                # Negamax、Alpha-Beta 和迭代加深
+│   │   ├── training_data.hpp         # FEN 标注与自我对弈数据生成
 │   │   └── transposition_table.hpp   # 置换表
 │   ├── src/                          # 各模块的 C++ 实现和命令行程序
 │   └── tests/
@@ -37,8 +39,10 @@ chinese-cheese-ai/
 │   ├── model.py                      # PyTorch NNUE 网络与稀疏批处理
 │   ├── dataset.py                    # JSONL 训练样本加载
 │   ├── train.py                      # 训练、验证、检查点和续训
+│   ├── iterate.py                    # 多代数据生成、回放训练、导出和恢复
 │   ├── export_nnue.py                # 导出 XQNNUEF1 权重
 │   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
+│   ├── examples/positions.fen        # 批量标注输入示例
 │   └── tests/                        # Python 训练端自动测试
 ├── .vscode/                          # VS Code 构建、测试和调试配置
 ├── CMakeLists.txt                    # CMake 构建配置
@@ -58,6 +62,9 @@ flowchart LR
     EVAL --> HCE["HandcraftedEvaluator"]
     EVAL --> NN["NnueEvaluator"]
     SEARCH --> TT["TranspositionTable 置换表"]
+    DATA["TrainingDataGenerator"] --> SEARCH
+    DATA --> GH
+    DATA --> JSONL["NNUE 训练 JSONL"]
 ```
 
 ## 实现思路
@@ -185,7 +192,40 @@ JSON Lines，每行至少包含 FEN 和当前行棋方视角的引擎分值：
 float32 前向传播，然后检查误差是否在容差内。这可以尽早发现特征方向、矩阵转置、
 拼接顺序或权重排列不一致的问题。
 
-### 6. Negamax 与 Alpha-Beta/PVS 搜索
+### 6. 训练数据生成
+
+`xiangqi_generate_data` 使用现有手工评估搜索器生成 Python 训练端可以直接读取的
+JSONL。它提供两种互补模式：
+
+- `label`：从纯文本文件逐行读取 FEN，以固定深度搜索分数批量标注。
+- `selfplay`：从标准初始局面完整对弈，在开局、中局和残局按随机间隔采样。
+
+首代可以使用手工评估教师；传入 `--nnue MODEL` 后，走棋与标签搜索会改用指定
+NNUE，因此训练完成的上一代模型可以为下一代制造局面和监督分数。
+
+自我对弈的前若干半回合不会从全部合法着中盲目随机，而是分别搜索根节点候选，
+只在评分距离最佳着不超过给定阈值的 Top-K 走法中随机选择。开局阶段结束后恢复
+始终选择最佳着。这样既能让对局进入不同中盘，又不会因为随手送子而产生大量失真
+局面。每条样本的 `score` 都是当前行棋方视角，默认过滤进入将杀区间的极端分数，
+并按包含行棋方的 Zobrist 哈希去重。
+
+生成器依据剩余非将帅子力将样本粗分为 `opening`、`middlegame` 和 `endgame`。
+自我对弈样本还会附带 `game`、`ply`，自然结束的对局会写入当前行棋方视角的
+最终 `result` 元数据；达到最大半回合数而截断的对局不会伪造和棋结果。
+Python 第一版训练器会忽略这些额外字段，后续可用于混合搜索分数与对局结果。
+实际走子始终写入 `GameHistory`，因此三次重复、长将、长捉和 60 回合无吃子裁决
+会参与对局和搜索。历史规则导致的终局不会作为仅含棋盘特征的 NNUE 标签写入。
+
+`training.iterate` 把多代流程串成一个可恢复任务：每一代先用当前冠军生成新数据，
+再联合最近若干代数据进行回放训练，随后导出 C++ 权重并执行 Python/C++ 数值一致性
+验证。只有全部步骤成功才会原子更新 `state.json` 和稳定的 `champion.*` 文件；作业
+被 Slurm 超时终止后，使用相同工作目录重新运行即可从未完成代继续。
+
+当前自动晋升只保证文件完整和跨语言推理一致，并没有证明候选棋力更强。正式多代
+训练前仍需实现候选模型与冠军模型的自动对局门禁；在此之前建议限制代数并人工检查
+每一代结果，避免把偶然退步无限放大。
+
+### 7. Negamax 与 Alpha-Beta/PVS 搜索
 
 双方对称的零和搜索被写成 Negamax 形式：当前节点的分数等于对手子节点分数的
 相反数。在此基础上使用 Alpha-Beta 窗口剪掉不可能影响最终选择的分支。
@@ -198,13 +238,13 @@ Alpha-Beta 路线进一步使用 PVS：排序后的第一候选着以完整窗�
 仓库同时保留无剪枝 Negamax，便于对照验证 Alpha-Beta 的结果是否正确。搜索器
 还会统计主搜索节点、静态搜索节点、剪枝次数和置换表命中次数。
 
-### 7. 静态搜索
+### 8. 静态搜索
 
 固定深度搜索如果正好停在一次交换中间，评估会产生明显波动。静态搜索会在叶子
 节点继续搜索吃子着，直到局面相对稳定；如果当前正被将军，则搜索全部合法应将，
 避免直接评估一个尚未处理的将军局面。
 
-### 8. 迭代加深与置换表
+### 9. 迭代加深与置换表
 
 迭代加深依次搜索深度 1、2、3……，每完成一层就保留该层的最佳着法、评分和
 统计信息。这为后续加入限时搜索打下基础，也能为更深一层提供较好的着法顺序。
@@ -283,6 +323,11 @@ MVV-LVA 和 SEE 使用手工
 - [x] Python/PyTorch 同构 NNUE 网络和稀疏批处理
 - [x] JSONL 监督训练、验证、检查点和续训
 - [x] `XQNNUEF1` 权重导出与 Python/C++ 一致性验证
+- [x] 纯文本 FEN 固定深度批量标注
+- [x] 带近似最佳开局随机性的完整自我对弈数据生成
+- [x] 局面阶段标记、哈希去重、极端分数过滤和对局结果元数据
+- [x] NNUE 教师自我对弈和最近多代数据回放
+- [x] 带原子状态、断点恢复、导出验证与自动晋升的迭代脚本
 - [x] 固定深度 Negamax
 - [x] Alpha-Beta 剪枝
 - [x] PVS 零窗口试探与必要的完整窗口重搜
@@ -310,7 +355,9 @@ MVV-LVA 和 SEE 使用手工
 - [ ] 时间控制与可中断搜索
 - [ ] LMR、空步裁剪和期望窗口等搜索增强
 - [ ] NNUE SIMD 与整数量化优化
-- [ ] Python 自我对弈和大规模训练数据生成
+- [ ] 多进程分片生成、断点续写和大规模数据集管理
+- [ ] 真实棋谱解析与中残局数据补充
+- [ ] 候选模型对冠军模型的自动对局和统计晋升门禁
 - [ ] UCCI 等标准引擎通信协议
 - [ ] 棋盘识别、落子和 GUI 控制适配层
 
@@ -344,6 +391,63 @@ ctest --test-dir build --output-on-failure
 python3 -m pip install -r training/requirements.txt
 make python-test
 ```
+
+从纯文本 FEN 列表生成搜索标签：
+
+```bash
+./build/make/xiangqi_generate_data label \
+  --input training/examples/positions.fen \
+  --output training/runs/labeled.jsonl \
+  --depth 6
+```
+
+生成包含开局、中局和残局采样的自我对弈数据：
+
+```bash
+./build/make/xiangqi_generate_data selfplay \
+  --output training/runs/selfplay.jsonl \
+  --games 1000 \
+  --play-depth 4 \
+  --label-depth 6 \
+  --random-plies 10 \
+  --random-top-k 3 \
+  --random-margin 150 \
+  --seed 1
+```
+
+输出文件默认必须不存在，防止误覆盖已有训练数据；需要向已有 JSONL 继续追加时
+显式传入 `--append`。使用 `--help` 可以查看采样间隔、最大半回合数、分数过滤和
+置换表容量等全部参数。
+
+从手工评估教师开始，自动运行三代小规模迭代：
+
+```bash
+python3 -u -m training.iterate \
+  --work-dir training/runs/iterations \
+  --generations 3 \
+  --games-per-generation 20 \
+  --play-depth 2 \
+  --label-depth 4 \
+  --epochs-per-generation 10 \
+  --replay-generations 3 \
+  --batch-size 256 \
+  --device cpu
+```
+
+如果要从已经完成的 `nnue-1` 开始，首次运行额外传入：
+
+```bash
+python3 -u -m training.iterate \
+  --work-dir training/runs/iterations \
+  --generations 3 \
+  --bootstrap-checkpoint training/runs/nnue-1/best.pt \
+  --bootstrap-model training/runs/nnue-1/best.nnue \
+  --device cuda
+```
+
+`--generations` 表示本次调用新增完成多少代，而不是总目标代数。后续续跑时使用相同
+`--work-dir`，不要再次传入 bootstrap 参数；脚本会读取 `state.json`，自动选择
+上一代不可变检查点和模型。服务器任务被中断后也使用同一条续跑命令。
 
 使用仓库中的微型示例验证训练闭环：
 
@@ -423,7 +527,7 @@ b0c2
 
 1. 用更多真实棋例校准长捉例外，并扩展“一将一捉”等复杂循环责任。
 2. 完善着法排序和搜索剪枝，并加入时间管理，形成稳定的传统引擎基线。
-3. 用 Python/C++ 建立自我对弈、棋谱解析和大规模样本生成流程。
+3. 为数据生成加入多进程分片、断点续写，并通过棋谱解析补充高质量中残局。
 4. 对训练模型进行量化和 SIMD 推理优化，并通过对局评估棋力。
 5. 定义稳定的引擎通信接口，再单独实现棋盘识别与 GUI 操作模块。
 

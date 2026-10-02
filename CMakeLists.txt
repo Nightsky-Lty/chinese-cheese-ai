@@ -15,6 +15,7 @@ add_library(xiangqi_engine
     engine/src/nnue.cpp
     engine/src/position.cpp
     engine/src/search.cpp
+    engine/src/training_data.cpp
     engine/src/transposition_table.cpp
 )
 
@@ -28,6 +29,9 @@ target_compile_options(xiangqi_engine PRIVATE
 
 add_executable(xiangqi_cli engine/src/main.cpp)
 target_link_libraries(xiangqi_cli PRIVATE xiangqi_engine)
+
+add_executable(xiangqi_generate_data engine/src/generate_data.cpp)
+target_link_libraries(xiangqi_generate_data PRIVATE xiangqi_engine)
 
 enable_testing()
 add_executable(xiangqi_rules_tests engine/tests/rules_tests.cpp)

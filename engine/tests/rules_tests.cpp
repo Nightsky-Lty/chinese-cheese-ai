@@ -6,6 +6,7 @@
 #include "xiangqi/move_ordering.hpp"
 #include "xiangqi/nnue.hpp"
 #include "xiangqi/search.hpp"
+#include "xiangqi/training_data.hpp"
 #include "xiangqi/transposition_table.hpp"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -1255,6 +1257,76 @@ void test_transposition_table_separates_rule_contexts() {
            "a cached board score cannot override a different 60-move context");
 }
 
+void test_training_data_phase_and_labeling() {
+    expect(xiangqi::classify_game_phase(Position::initial()) ==
+               xiangqi::GamePhase::Opening,
+           "initial position is classified as opening");
+    const Position middlegame = Position::from_fen(
+        "r3k4/9/1c7/2n6/9/9/2N6/1C7/9/R3K4 w");
+    expect(xiangqi::classify_game_phase(middlegame) ==
+               xiangqi::GamePhase::Middlegame,
+           "partially exchanged position is classified as middlegame");
+    const Position endgame = Position::from_fen(
+        "4k4/9/9/9/9/9/9/4R4/9/4K4 w");
+    expect(xiangqi::classify_game_phase(endgame) ==
+               xiangqi::GamePhase::Endgame,
+           "low-material position is classified as endgame");
+
+    const std::string initial_fen = Position::initial().to_fen();
+    std::istringstream input(
+        "# duplicate positions are ignored\n" + initial_fen + "\n" +
+        initial_fen + "\n");
+    std::ostringstream output;
+    xiangqi::TrainingDataGenerator generator;
+    const xiangqi::TrainingDataStats stats = generator.label_positions(
+        input, output,
+        xiangqi::LabelPositionsConfig{
+            .depth = 1,
+            .quiescence_depth = 0,
+            .maximum_absolute_score = 28000,
+            .weight = 1.0,
+            .deduplicate = true,
+        });
+    expect(stats.input_positions == 2 && stats.samples_written == 1 &&
+               stats.duplicate_positions == 1,
+           "FEN labeling reports written and duplicate positions");
+    expect(output.str().find("\"source\":\"labeled-fen\"") !=
+               std::string::npos &&
+               output.str().find("\"phase\":\"opening\"") !=
+               std::string::npos,
+           "FEN labeling writes Python-compatible JSONL metadata");
+}
+
+void test_training_data_selfplay() {
+    std::ostringstream output;
+    xiangqi::TrainingDataGenerator generator;
+    const xiangqi::TrainingDataStats stats = generator.self_play(
+        output,
+        xiangqi::SelfPlayConfig{
+            .games = 1,
+            .play_depth = 1,
+            .label_depth = 1,
+            .quiescence_depth = 0,
+            .maximum_plies = 2,
+            .sample_start_ply = 0,
+            .minimum_sample_gap = 1,
+            .maximum_sample_gap = 1,
+            .random_opening_plies = 0,
+            .random_top_k = 1,
+            .random_score_margin = 0,
+            .maximum_absolute_score = 28000,
+            .weight = 1.0,
+            .seed = 7,
+            .deduplicate = true,
+        });
+    expect(stats.games == 1 && stats.samples_written == 2,
+           "short self-play generates one sample at every requested ply");
+    expect(output.str().find("\"source\":\"selfplay\"") !=
+               std::string::npos &&
+               output.str().find("\"result\"") == std::string::npos,
+           "truncated self-play JSONL identifies its source without inventing a result");
+}
+
 }  // namespace
 
 int main() {
@@ -1302,6 +1374,8 @@ int main() {
     test_search_uses_perpetual_chase_result();
     test_search_avoids_own_perpetual_chase();
     test_transposition_table_separates_rule_contexts();
+    test_training_data_phase_and_labeling();
+    test_training_data_selfplay();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
