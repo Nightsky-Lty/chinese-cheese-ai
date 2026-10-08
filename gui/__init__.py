@@ -2,7 +2,7 @@
 
 from .geometry import BoardCalibration, Point, Rect, parse_move
 from .board_state import BoardState, DetectedMove, StableBoardDetector, detect_move
-from .game_controller import ControllerEvent, ControllerPhase, GameController
+from .game_controller import ControllerEvent, ControllerPhase, GameController, PauseKind
 from .recognition import RecognitionResult, TemplateLibrary, TemplatePieceRecognizer
 from .observer import GameObserver, ObserverEvent
 from .protocol_client import ProtocolGameResult
@@ -16,6 +16,7 @@ __all__ = [
     "DetectedMove",
     "GameObserver",
     "GameController",
+    "PauseKind",
     "Point",
     "ObserverEvent",
     "ProtocolGameResult",

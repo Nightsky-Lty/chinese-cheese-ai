@@ -15,7 +15,7 @@ from .capture import CapturedFrame, capture_window, save_frame
 from .config import GuiConfig, load_config, save_config
 from .control import execute_move
 from .engine_client import analyze_fen
-from .game_controller import ControllerEvent, GameController
+from .game_controller import ControllerEvent, ControllerPhase, GameController
 from .geometry import BoardCalibration, Point, Rect
 from .observer import GameObserver, ObserverEvent
 from .protocol_client import ProtocolEngineClient
@@ -192,10 +192,48 @@ def _print_controller_event(event: ControllerEvent, *, execute: bool) -> None:
         )
     elif event.kind == "move_confirmed":
         print(f"[confirmed] {event.move}")
+    elif event.kind == "resumed":
+        print(f"[resumed] {event.message}")
+    elif event.kind == "observed_move_accepted":
+        print(f"[accepted] {event.message}")
     elif event.kind == "paused":
-        print(f"[paused] {event.message}")
+        detail = f":{event.pause_kind.value}" if event.pause_kind is not None else ""
+        print(f"[paused{detail}] {event.message}")
     elif event.kind == "finished":
         print(f"[finished] {event.message}")
+
+
+def _prompt_controller_recovery(
+    controller: GameController, *, execute: bool
+) -> None:
+    """在显式交互模式下请求一次安全恢复选择。"""
+
+    choices: list[str] = []
+    if controller.can_resume_waiting:
+        choices.append("r=resume waiting")
+    if controller.can_accept_observed_move:
+        choices.append("a=accept observed legal move")
+    if not choices:
+        print("[recovery] this pause requires stopping and manual inspection")
+        return
+    choices.append("q=quit")
+    prompt = "[recovery] " + ", ".join(choices) + ": "
+    while controller.phase == ControllerPhase.PAUSED:
+        try:
+            selection = input(prompt).strip().lower()
+        except EOFError:
+            print("[recovery] input closed; controller remains paused")
+            return
+        if selection == "r" and controller.can_resume_waiting:
+            _print_controller_event(controller.resume_waiting(), execute=execute)
+            return
+        if selection == "a" and controller.can_accept_observed_move:
+            for event in controller.accept_observed_move():
+                _print_controller_event(event, execute=execute)
+            return
+        if selection == "q":
+            return
+        print("[recovery] invalid choice")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -324,6 +362,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     control.add_argument(
         "--execute", action="store_true", help="显式允许实时模式发送鼠标点击"
+    )
+    control.add_argument(
+        "--interactive-recovery",
+        action="store_true",
+        help="暂停时在终端要求人工选择恢复动作",
     )
     return parser
 
@@ -582,6 +625,13 @@ def main(argv: list[str] | None = None) -> int:
                         events = controller.process_recognition(recognition)
                         for event in events:
                             _print_controller_event(event, execute=arguments.execute)
+                        if (
+                            arguments.interactive_recovery
+                            and controller.phase == ControllerPhase.PAUSED
+                        ):
+                            _prompt_controller_recovery(
+                                controller, execute=arguments.execute
+                            )
                         frame_count += 1
                         if live_window_id is not None:
                             time.sleep(arguments.interval)

@@ -29,15 +29,22 @@ def apply_coordinate_move(board: BoardState, move: str) -> BoardState:
 class FakeObserver:
     """按测试预设顺序返回观察器事件。"""
 
-    def __init__(self, side_to_move: str, events: list[tuple[ObserverEvent, str]]) -> None:
+    def __init__(
+        self,
+        side_to_move: str,
+        events: list[tuple[ObserverEvent | None, str]],
+    ) -> None:
         self.side_to_move = side_to_move
         self.events = events
+        self.board: BoardState | None = None
 
     def process_board(self, _board: BoardState) -> ObserverEvent | None:
         if not self.events:
             return None
         event, next_side = self.events.pop(0)
         self.side_to_move = next_side
+        if event is not None and event.kind == "initialized":
+            self.board = _board
         return event
 
 
@@ -112,6 +119,13 @@ class GameControllerTests(unittest.TestCase):
         controller.process_board(self.board)
         self.assertEqual(requested, ["b0c2"])
 
+        recovered = controller.accept_observed_move()
+        self.assertEqual(recovered[0].kind, "observed_move_accepted")
+        self.assertEqual(recovered[0].move, "h0g2")
+        self.assertEqual(controller.phase, ControllerPhase.WAITING_OPPONENT)
+        self.assertIsNone(controller.pending_move)
+        self.assertEqual(requested, ["b0c2"])
+
     def test_recognition_rejection_and_executor_failure_pause(self) -> None:
         rejected = FakeObserver(
             "red", [(ObserverEvent("rejected", message="visual noise"), "red")]
@@ -164,7 +178,13 @@ class GameControllerTests(unittest.TestCase):
 
     def test_unconfirmed_move_pauses_after_frame_limit(self) -> None:
         observer = FakeObserver(
-            "red", [(ObserverEvent("initialized", best_move="b0c2"), "red")]
+            "red",
+            [
+                (ObserverEvent("initialized", best_move="b0c2"), "red"),
+                (None, "red"),
+                (None, "red"),
+                (ObserverEvent("move", move="b0c2", best_move="b9c7"), "black"),
+            ],
         )
         controller = GameController(
             cast(GameObserver, observer),
@@ -177,6 +197,44 @@ class GameControllerTests(unittest.TestCase):
         events = controller.process_board(self.board)
         self.assertEqual(events[-1].kind, "paused")
         self.assertIn("2 frames", events[-1].message or "")
+        resumed = controller.resume_waiting()
+        self.assertEqual(resumed.kind, "resumed")
+        self.assertEqual(controller.phase, ControllerPhase.AWAITING_CONFIRMATION)
+        self.assertEqual(controller.process_board(self.board)[0].kind, "move_confirmed")
+
+    def test_rejected_frame_can_resume_but_executor_failure_cannot(self) -> None:
+        rejected = FakeObserver(
+            "black",
+            [
+                (ObserverEvent("initialized", best_move="b9c7"), "black"),
+                (ObserverEvent("rejected", message="visual noise"), "black"),
+            ],
+        )
+        controller = GameController(
+            cast(GameObserver, rejected),
+            ai_side="red",
+            move_executor=lambda _move: None,
+        )
+        controller.process_board(self.board)
+        controller.process_board(self.board)
+        self.assertTrue(controller.can_resume_waiting)
+        controller.resume_waiting()
+        self.assertEqual(controller.phase, ControllerPhase.WAITING_OPPONENT)
+
+        failing = FakeObserver(
+            "red", [(ObserverEvent("initialized", best_move="b0c2"), "red")]
+        )
+
+        def fail(_move: str) -> None:
+            raise RuntimeError("actuator failure")
+
+        failed_controller = GameController(
+            cast(GameObserver, failing), ai_side="red", move_executor=fail
+        )
+        failed_controller.process_board(self.board)
+        self.assertFalse(failed_controller.can_resume_waiting)
+        with self.assertRaises(RuntimeError):
+            failed_controller.resume_waiting()
 
     def test_real_observer_search_and_visual_confirmation_loop(self) -> None:
         executable = Path("build/make/xiangqi_protocol")

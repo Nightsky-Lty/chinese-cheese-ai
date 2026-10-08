@@ -21,6 +21,16 @@ class ControllerPhase(str, Enum):
     FINISHED = "finished"
 
 
+class PauseKind(str, Enum):
+    """暂停原因分类，用于限制可以安全执行的人工恢复动作。"""
+
+    RECOGNITION_REJECTED = "recognition_rejected"
+    CONFIRMATION_TIMEOUT = "confirmation_timeout"
+    MOVE_MISMATCH = "move_mismatch"
+    EXECUTOR_FAILED = "executor_failed"
+    EXTERNAL = "external"
+
+
 @dataclass(frozen=True)
 class ControllerEvent:
     """控制器处理一帧棋盘后产生的可观察事件。
@@ -31,6 +41,7 @@ class ControllerEvent:
         move: 与事件相关的四字符引擎走法。
         message: 面向日志或界面的补充说明。
         observer_event: 触发本事件的底层观察器事件。
+        pause_kind: 暂停事件的机器可读原因分类。
     """
 
     kind: str
@@ -38,6 +49,7 @@ class ControllerEvent:
     move: str | None = None
     message: str | None = None
     observer_event: ObserverEvent | None = None
+    pause_kind: PauseKind | None = None
 
 
 MoveExecutor = Callable[[str], None]
@@ -80,6 +92,8 @@ class GameController:
         self.pending_move: str | None = None
         self.pause_reason: str | None = None
         self._confirmation_frames = 0
+        self._pause_kind: PauseKind | None = None
+        self._paused_observer_event: ObserverEvent | None = None
 
     @property
     def active(self) -> bool:
@@ -87,12 +101,87 @@ class GameController:
 
         return self.phase not in {ControllerPhase.PAUSED, ControllerPhase.FINISHED}
 
-    def pause(self, reason: str) -> ControllerEvent:
+    @property
+    def can_resume_waiting(self) -> bool:
+        """当前暂停是否允许在不改变引擎历史的情况下继续观察。"""
+
+        return self.phase == ControllerPhase.PAUSED and self._pause_kind in {
+            PauseKind.RECOGNITION_REJECTED,
+            PauseKind.CONFIRMATION_TIMEOUT,
+            PauseKind.EXTERNAL,
+        }
+
+    @property
+    def can_accept_observed_move(self) -> bool:
+        """是否存在已通过 C++ 合法性检查、但与预期不同的实际走法。"""
+
+        event = self._paused_observer_event
+        return (
+            self.phase == ControllerPhase.PAUSED
+            and self._pause_kind == PauseKind.MOVE_MISMATCH
+            and event is not None
+            and event.kind == "move"
+            and event.move is not None
+        )
+
+    def pause(
+        self, reason: str, kind: PauseKind = PauseKind.EXTERNAL
+    ) -> ControllerEvent:
         """安全暂停控制器，并保存需要人工检查的原因。"""
 
         self.phase = ControllerPhase.PAUSED
         self.pause_reason = reason
-        return ControllerEvent("paused", self.phase, self.pending_move, reason)
+        self._pause_kind = kind
+        self._paused_observer_event = None
+        return ControllerEvent(
+            "paused", self.phase, self.pending_move, reason, pause_kind=kind
+        )
+
+    def resume_waiting(self) -> ControllerEvent:
+        """人工确认局面安全后继续观察，但绝不重新发送鼠标点击。"""
+
+        if not self.can_resume_waiting:
+            raise RuntimeError("this pause cannot safely resume waiting")
+        self._confirmation_frames = 0
+        self.pause_reason = None
+        self._pause_kind = None
+        self._paused_observer_event = None
+        if self.pending_move is not None:
+            self.phase = ControllerPhase.AWAITING_CONFIRMATION
+        elif self.observer.board is None:
+            self.phase = ControllerPhase.WAITING_BOARD
+        else:
+            self.phase = ControllerPhase.WAITING_OPPONENT
+        return ControllerEvent(
+            "resumed",
+            self.phase,
+            self.pending_move,
+            "continued without repeating the previous click",
+        )
+
+    def accept_observed_move(self) -> tuple[ControllerEvent, ...]:
+        """人工接受与预期不同、但已由 C++ 验证合法的实际走法。"""
+
+        if not self.can_accept_observed_move:
+            raise RuntimeError("there is no validated observed move to accept")
+        event = self._paused_observer_event
+        assert event is not None
+        expected = self.pending_move
+        observed = event.move
+        self.pending_move = None
+        self._confirmation_frames = 0
+        self.pause_reason = None
+        self._pause_kind = None
+        self._paused_observer_event = None
+        following = self._advance_after_event(event, [])
+        recovered = ControllerEvent(
+            "observed_move_accepted",
+            self.phase,
+            observed,
+            f"accepted {observed} instead of expected {expected}",
+            event,
+        )
+        return (recovered, *following)
 
     def process_recognition(self, result: RecognitionResult) -> tuple[ControllerEvent, ...]:
         """处理一帧识别结果，并返回本帧产生的全部控制事件。"""
@@ -126,7 +215,17 @@ class GameController:
         )
         self.phase = ControllerPhase.PAUSED
         self.pause_reason = reason
-        return (ControllerEvent("paused", self.phase, self.pending_move, reason),)
+        self._pause_kind = PauseKind.CONFIRMATION_TIMEOUT
+        self._paused_observer_event = None
+        return (
+            ControllerEvent(
+                "paused",
+                self.phase,
+                self.pending_move,
+                reason,
+                pause_kind=self._pause_kind,
+            ),
+        )
 
     def _handle_observer_event(
         self, event: ObserverEvent | None
@@ -139,9 +238,16 @@ class GameController:
             reason = event.message or "recognized board was rejected"
             self.phase = ControllerPhase.PAUSED
             self.pause_reason = reason
+            self._pause_kind = PauseKind.RECOGNITION_REJECTED
+            self._paused_observer_event = event
             return (
                 ControllerEvent(
-                    "paused", self.phase, self.pending_move, reason, event
+                    "paused",
+                    self.phase,
+                    self.pending_move,
+                    reason,
+                    event,
+                    self._pause_kind,
                 ),
             )
 
@@ -155,6 +261,8 @@ class GameController:
                     )
                     self.phase = ControllerPhase.PAUSED
                     self.pause_reason = reason
+                    self._pause_kind = PauseKind.MOVE_MISMATCH
+                    self._paused_observer_event = event
                     return (
                         ControllerEvent(
                             "paused",
@@ -162,6 +270,7 @@ class GameController:
                             self.pending_move,
                             reason,
                             event,
+                            self._pause_kind,
                         ),
                     )
                 confirmed = self.pending_move
@@ -188,6 +297,13 @@ class GameController:
             emitted.append(
                 ControllerEvent("initialized", self.phase, observer_event=event)
             )
+
+        return self._advance_after_event(event, emitted)
+
+    def _advance_after_event(
+        self, event: ObserverEvent, emitted: list[ControllerEvent]
+    ) -> tuple[ControllerEvent, ...]:
+        """根据已接受局面的行棋方继续等待、结束或请求唯一一步执行。"""
 
         if event.best_move is None:
             self.phase = ControllerPhase.FINISHED
@@ -219,9 +335,16 @@ class GameController:
             reason = f"move executor failed for {event.best_move}: {error}"
             self.phase = ControllerPhase.PAUSED
             self.pause_reason = reason
+            self._pause_kind = PauseKind.EXECUTOR_FAILED
+            self._paused_observer_event = event
             emitted.append(
                 ControllerEvent(
-                    "paused", self.phase, event.best_move, reason, event
+                    "paused",
+                    self.phase,
+                    event.best_move,
+                    reason,
+                    event,
+                    self._pause_kind,
                 )
             )
             return tuple(emitted)
