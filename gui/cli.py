@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -14,7 +15,10 @@ from .capture import CapturedFrame, capture_window, save_frame
 from .config import GuiConfig, load_config, save_config
 from .control import execute_move
 from .engine_client import analyze_fen
+from .game_controller import ControllerEvent, GameController
 from .geometry import BoardCalibration, Point, Rect
+from .observer import GameObserver, ObserverEvent
+from .protocol_client import ProtocolEngineClient
 from .recognition import (
     TemplateLibrary,
     TemplatePieceRecognizer,
@@ -149,6 +153,41 @@ def _save_pixels(pixels: np.ndarray, output: str | Path) -> Path:
     )
 
 
+def _print_observer_event(event: ObserverEvent) -> None:
+    """以便于终端阅读的格式输出观察器事件。"""
+
+    if event.kind == "rejected":
+        print(f"[rejected] {event.message}")
+        return
+    if event.kind == "initialized":
+        print(f"[initialized] {event.fen}")
+    else:
+        print(f"[move] {event.move} -> {event.fen}")
+    if event.best_move is not None:
+        print(
+            f"[suggestion] {event.best_move} score={event.score} depth={event.depth}"
+        )
+
+
+def _print_controller_event(event: ControllerEvent, *, execute: bool) -> None:
+    """输出连续对局控制器的状态变化。"""
+
+    if event.kind == "initialized":
+        fen = event.observer_event.fen if event.observer_event is not None else None
+        print(f"[initialized] {fen or 'board accepted'}")
+    elif event.kind == "opponent_move":
+        print(f"[opponent] {event.move}")
+    elif event.kind == "move_requested":
+        action = "clicked" if execute else "preview-only"
+        print(f"[ai-move] {event.move} ({action}, waiting for confirmation)")
+    elif event.kind == "move_confirmed":
+        print(f"[confirmed] {event.move}")
+    elif event.kind == "paused":
+        print(f"[paused] {event.message}")
+    elif event.kind == "finished":
+        print(f"[finished] {event.message}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """创建 GUI 自动化命令行参数解析器。"""
 
@@ -214,6 +253,66 @@ def build_parser() -> argparse.ArgumentParser:
     recognize.add_argument("--engine", help="可选 xiangqi_cli 路径")
     recognize.add_argument("--depth", type=int, default=4, help="引擎搜索深度")
     recognize.add_argument("--nnue", help="可选 NNUE 权重")
+
+    observe = commands.add_parser("observe", help="只读跟踪稳定局面和合法走法")
+    observe.add_argument("--config", default="gui/wechat_board.json", help="标定 JSON")
+    observe.add_argument(
+        "--templates", default="gui/templates/jj_default.npz", help="棋子模板文件"
+    )
+    source = observe.add_mutually_exclusive_group(required=True)
+    source.add_argument("--live", action="store_true", help="持续只读截图当前窗口")
+    source.add_argument("--image-dir", help="按文件名顺序读取离线截图目录")
+    observe.add_argument("--query", help="覆盖配置中的窗口搜索文本")
+    observe.add_argument("--index", type=int, default=0, help="匹配结果序号")
+    observe.add_argument(
+        "--side", choices=("red", "black"), required=True, help="初始行棋方"
+    )
+    observe.add_argument(
+        "--protocol", default="build/make/xiangqi_protocol", help="常驻协议程序"
+    )
+    observe.add_argument("--nnue", help="可选 NNUE 权重")
+    observe.add_argument("--depth", type=int, default=4, help="提示着搜索深度")
+    observe.add_argument("--stable-frames", type=int, default=3, help="稳定帧门槛")
+    observe.add_argument("--interval", type=float, default=0.2, help="实时截图间隔秒数")
+    observe.add_argument("--max-frames", type=int, help="最多处理帧数，便于测试")
+    observe.add_argument(
+        "--repeat-each", type=int, default=1, help="离线模式下每张图片重复提交次数"
+    )
+
+    control = commands.add_parser("control", help="连续对局闭环；默认只预览不点击")
+    control.add_argument("--config", default="gui/wechat_board.json", help="标定 JSON")
+    control.add_argument(
+        "--templates", default="gui/templates/jj_default.npz", help="棋子模板文件"
+    )
+    control_source = control.add_mutually_exclusive_group(required=True)
+    control_source.add_argument("--live", action="store_true", help="持续截图目标窗口")
+    control_source.add_argument("--image-dir", help="按文件名顺序读取离线截图目录")
+    control.add_argument("--query", help="覆盖配置中的窗口搜索文本")
+    control.add_argument("--index", type=int, default=0, help="匹配结果序号")
+    control.add_argument(
+        "--side", choices=("red", "black"), required=True, help="初始行棋方"
+    )
+    control.add_argument(
+        "--ai-side", choices=("red", "black"), required=True, help="引擎控制方"
+    )
+    control.add_argument(
+        "--protocol", default="build/make/xiangqi_protocol", help="常驻协议程序"
+    )
+    control.add_argument("--nnue", help="可选 NNUE 权重")
+    control.add_argument("--depth", type=int, default=4, help="引擎搜索深度")
+    control.add_argument("--stable-frames", type=int, default=3, help="稳定帧门槛")
+    control.add_argument("--interval", type=float, default=0.2, help="截图间隔秒数")
+    control.add_argument("--click-interval", type=float, default=0.25, help="两次点击间隔")
+    control.add_argument(
+        "--confirmation-frames", type=int, default=30, help="落子确认超时帧数"
+    )
+    control.add_argument("--max-frames", type=int, help="最多处理帧数，便于测试")
+    control.add_argument(
+        "--repeat-each", type=int, default=1, help="离线模式下每张图片重复提交次数"
+    )
+    control.add_argument(
+        "--execute", action="store_true", help="显式允许实时模式发送鼠标点击"
+    )
     return parser
 
 
@@ -308,6 +407,172 @@ def main(argv: list[str] | None = None) -> int:
                     encoding="utf-8",
                 )
                 print(f"结构化结果: {destination.resolve()}")
+            return 0
+
+        if arguments.command == "observe":
+            if arguments.interval <= 0:
+                raise ValueError("capture interval must be positive")
+            if arguments.repeat_each <= 0:
+                raise ValueError("repeat-each must be positive")
+            library = TemplateLibrary.load(arguments.templates)
+            recognizer = TemplatePieceRecognizer(library)
+            live_window = None
+            image_paths: list[Path] = []
+            if arguments.live:
+                query = arguments.query or config.window_query
+                live_window = _select_window(query, arguments.index)
+            else:
+                directory = Path(arguments.image_dir)
+                if not directory.is_dir():
+                    raise RuntimeError(f"image directory does not exist: {directory}")
+                image_paths = sorted(
+                    path
+                    for path in directory.iterdir()
+                    if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                )
+                if not image_paths:
+                    raise RuntimeError(f"image directory contains no supported images: {directory}")
+
+            frame_count = 0
+            with ProtocolEngineClient(arguments.protocol, nnue=arguments.nnue) as engine:
+                observer = GameObserver(
+                    engine,
+                    initial_side=arguments.side,
+                    stable_frames=arguments.stable_frames,
+                    search_depth=arguments.depth,
+                )
+                try:
+                    while arguments.max_frames is None or frame_count < arguments.max_frames:
+                        if live_window is not None:
+                            images = [capture_window(live_window).pixels]
+                        else:
+                            if frame_count >= len(image_paths) * arguments.repeat_each:
+                                break
+                            path = image_paths[frame_count // arguments.repeat_each]
+                            images = [_read_image(path)]
+                        for image in images:
+                            result = recognizer.recognize(image, config.calibration)
+                            event = observer.process_recognition(result)
+                            if event is not None:
+                                _print_observer_event(event)
+                            frame_count += 1
+                        if live_window is not None:
+                            time.sleep(arguments.interval)
+                except KeyboardInterrupt:
+                    print("观察器已停止")
+            return 0
+
+        if arguments.command == "control":
+            if arguments.interval <= 0:
+                raise ValueError("capture interval must be positive")
+            if arguments.click_interval < 0:
+                raise ValueError("click interval cannot be negative")
+            if arguments.repeat_each <= 0:
+                raise ValueError("repeat-each must be positive")
+            if arguments.confirmation_frames <= 0:
+                raise ValueError("confirmation-frames must be positive")
+            if arguments.execute and not arguments.live:
+                raise ValueError("--execute is only valid together with --live")
+
+            recognizer = TemplatePieceRecognizer(
+                TemplateLibrary.load(arguments.templates)
+            )
+            live_window = None
+            live_window_id: int | None = None
+            query = arguments.query or config.window_query
+            image_paths: list[Path] = []
+            if arguments.live:
+                live_window = _select_window(query, arguments.index)
+                live_window_id = live_window.window_id
+            else:
+                directory = Path(arguments.image_dir)
+                if not directory.is_dir():
+                    raise RuntimeError(f"image directory does not exist: {directory}")
+                image_paths = sorted(
+                    path
+                    for path in directory.iterdir()
+                    if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                )
+                if not image_paths:
+                    raise RuntimeError(
+                        f"image directory contains no supported images: {directory}"
+                    )
+
+            def execute_requested_move(move_text: str) -> None:
+                """在实时窗口换算坐标，并仅在显式授权时点击。"""
+
+                if live_window is None:
+                    return
+                execute_move(
+                    live_window,
+                    config.calibration,
+                    move_text,
+                    execute=arguments.execute,
+                    click_interval=arguments.click_interval,
+                )
+
+            if arguments.execute:
+                print("[armed] real mouse clicks are enabled for the selected window")
+            frame_count = 0
+            with ProtocolEngineClient(arguments.protocol, nnue=arguments.nnue) as engine:
+                observer = GameObserver(
+                    engine,
+                    initial_side=arguments.side,
+                    stable_frames=arguments.stable_frames,
+                    search_depth=arguments.depth,
+                )
+                controller = GameController(
+                    observer,
+                    ai_side=arguments.ai_side,
+                    move_executor=execute_requested_move,
+                    confirmation_frame_limit=arguments.confirmation_frames,
+                )
+                try:
+                    while (
+                        controller.active
+                        and (
+                            arguments.max_frames is None
+                            or frame_count < arguments.max_frames
+                        )
+                    ):
+                        if live_window_id is not None:
+                            refreshed = next(
+                                (
+                                    candidate
+                                    for candidate in find_windows(query)
+                                    if candidate.window_id == live_window_id
+                                ),
+                                None,
+                            )
+                            if refreshed is None:
+                                event = controller.pause(
+                                    "selected window disappeared or became unavailable"
+                                )
+                                _print_controller_event(event, execute=arguments.execute)
+                                break
+                            live_window = refreshed
+                            image = capture_window(live_window).pixels
+                        else:
+                            if frame_count >= len(image_paths) * arguments.repeat_each:
+                                break
+                            path = image_paths[frame_count // arguments.repeat_each]
+                            image = _read_image(path)
+
+                        recognition = recognizer.recognize(
+                            image, config.calibration
+                        )
+                        events = controller.process_recognition(recognition)
+                        for event in events:
+                            _print_controller_event(event, execute=arguments.execute)
+                        frame_count += 1
+                        if live_window_id is not None:
+                            time.sleep(arguments.interval)
+                except KeyboardInterrupt:
+                    event = controller.pause("stopped by user")
+                    _print_controller_event(event, execute=arguments.execute)
+                except (RuntimeError, OSError) as error:
+                    event = controller.pause(f"capture or control failed: {error}")
+                    _print_controller_event(event, execute=arguments.execute)
             return 0
 
         query = arguments.query or config.window_query
