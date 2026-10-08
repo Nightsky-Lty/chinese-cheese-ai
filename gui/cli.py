@@ -164,8 +164,10 @@ def _print_observer_event(event: ObserverEvent) -> None:
     else:
         print(f"[move] {event.move} -> {event.fen}")
     if event.best_move is not None:
+        timeout = " timedout=true" if event.timed_out else ""
         print(
-            f"[suggestion] {event.best_move} score={event.score} depth={event.depth}"
+            f"[suggestion] {event.best_move} score={event.score} "
+            f"depth={event.depth}{timeout}"
         )
 
 
@@ -179,7 +181,15 @@ def _print_controller_event(event: ControllerEvent, *, execute: bool) -> None:
         print(f"[opponent] {event.move}")
     elif event.kind == "move_requested":
         action = "clicked" if execute else "preview-only"
-        print(f"[ai-move] {event.move} ({action}, waiting for confirmation)")
+        timeout = (
+            ", time-limited"
+            if event.observer_event is not None and event.observer_event.timed_out
+            else ""
+        )
+        print(
+            f"[ai-move] {event.move} "
+            f"({action}{timeout}, waiting for confirmation)"
+        )
     elif event.kind == "move_confirmed":
         print(f"[confirmed] {event.move}")
     elif event.kind == "paused":
@@ -272,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     observe.add_argument("--nnue", help="可选 NNUE 权重")
     observe.add_argument("--depth", type=int, default=4, help="提示着搜索深度")
+    observe.add_argument("--move-time-ms", type=int, help="每步最大搜索毫秒数")
     observe.add_argument("--stable-frames", type=int, default=3, help="稳定帧门槛")
     observe.add_argument("--interval", type=float, default=0.2, help="实时截图间隔秒数")
     observe.add_argument("--max-frames", type=int, help="最多处理帧数，便于测试")
@@ -300,6 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     control.add_argument("--nnue", help="可选 NNUE 权重")
     control.add_argument("--depth", type=int, default=4, help="引擎搜索深度")
+    control.add_argument("--move-time-ms", type=int, help="每步最大搜索毫秒数")
     control.add_argument("--stable-frames", type=int, default=3, help="稳定帧门槛")
     control.add_argument("--interval", type=float, default=0.2, help="截图间隔秒数")
     control.add_argument("--click-interval", type=float, default=0.25, help="两次点击间隔")
@@ -414,6 +426,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("capture interval must be positive")
             if arguments.repeat_each <= 0:
                 raise ValueError("repeat-each must be positive")
+            if arguments.move_time_ms is not None and arguments.move_time_ms <= 0:
+                raise ValueError("move-time-ms must be positive")
             library = TemplateLibrary.load(arguments.templates)
             recognizer = TemplatePieceRecognizer(library)
             live_window = None
@@ -440,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
                     initial_side=arguments.side,
                     stable_frames=arguments.stable_frames,
                     search_depth=arguments.depth,
+                    move_time_ms=arguments.move_time_ms,
                 )
                 try:
                     while arguments.max_frames is None or frame_count < arguments.max_frames:
@@ -471,6 +486,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("repeat-each must be positive")
             if arguments.confirmation_frames <= 0:
                 raise ValueError("confirmation-frames must be positive")
+            if arguments.move_time_ms is not None and arguments.move_time_ms <= 0:
+                raise ValueError("move-time-ms must be positive")
             if arguments.execute and not arguments.live:
                 raise ValueError("--execute is only valid together with --live")
 
@@ -520,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
                     initial_side=arguments.side,
                     stable_frames=arguments.stable_frames,
                     search_depth=arguments.depth,
+                    move_time_ms=arguments.move_time_ms,
                 )
                 controller = GameController(
                     observer,

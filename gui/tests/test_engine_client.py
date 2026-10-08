@@ -43,10 +43,25 @@ class EngineClientTests(unittest.TestCase):
             analysis = client.search(depth=1)
             self.assertIsNotNone(analysis.best_move)
             self.assertEqual(analysis.depth, 1)
+            self.assertFalse(analysis.timed_out)
 
             restored = client.undo()
             self.assertEqual(restored.fen, initial.fen)
             self.assertEqual(restored.ply, 0)
+
+    def test_protocol_time_limit_returns_move_and_preserves_state(self) -> None:
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        with ProtocolEngineClient(executable) as client:
+            initial = client.state()
+            analysis = client.search(depth=64, move_time_ms=5)
+            self.assertTrue(analysis.timed_out)
+            self.assertIsNotNone(analysis.best_move)
+            self.assertEqual(client.state(), initial)
+
+            with self.assertRaises(ValueError):
+                client.search(depth=4, move_time_ms=0)
 
     def test_protocol_rejects_illegal_move(self) -> None:
         executable = Path("build/make/xiangqi_protocol")

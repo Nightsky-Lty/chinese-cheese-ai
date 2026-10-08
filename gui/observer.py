@@ -19,6 +19,7 @@ class ObserverEvent:
     best_move: str | None = None
     score: int | None = None
     depth: int | None = None
+    timed_out: bool = False
     outcome: str | None = None
     reason: str | None = None
     message: str | None = None
@@ -34,6 +35,7 @@ class GameObserver:
         initial_side: str,
         stable_frames: int = 3,
         search_depth: int = 4,
+        move_time_ms: int | None = None,
     ) -> None:
         """创建只读观察器。
 
@@ -42,6 +44,7 @@ class GameObserver:
             initial_side: 第一张稳定局面的当前行棋方。
             stable_frames: 接受局面前要求的连续相同帧数。
             search_depth: 每次接受局面后用于提示走法的搜索深度。
+            move_time_ms: 每次搜索的可选时间上限，单位毫秒。
         """
 
         side = initial_side.strip().lower()
@@ -49,9 +52,12 @@ class GameObserver:
             raise ValueError("initial side must be red or black")
         if search_depth <= 0:
             raise ValueError("search depth must be positive")
+        if move_time_ms is not None and move_time_ms <= 0:
+            raise ValueError("move time must be positive")
         self.engine = engine
         self.side_to_move = side
         self.search_depth = search_depth
+        self.move_time_ms = move_time_ms
         self.stability = StableBoardDetector(stable_frames)
         self.board: BoardState | None = None
 
@@ -63,6 +69,7 @@ class GameObserver:
             "best_move": analysis.best_move,
             "score": analysis.score,
             "depth": analysis.depth,
+            "timed_out": analysis.timed_out,
         }
 
     def _current_event_fields(self) -> dict[str, str | int | None]:
@@ -78,7 +85,11 @@ class GameObserver:
                 "reason": result.reason,
             }
         return {
-            **self._search_event_fields(self.engine.search(self.search_depth)),
+            **self._search_event_fields(
+                self.engine.search(
+                    self.search_depth, move_time_ms=self.move_time_ms
+                )
+            ),
             "outcome": result.outcome,
             "reason": result.reason,
         }

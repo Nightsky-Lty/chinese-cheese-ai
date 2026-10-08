@@ -28,6 +28,7 @@ class ProtocolSearchResult:
     score: int
     depth: int
     nodes: int
+    timed_out: bool
 
 
 @dataclass(frozen=True)
@@ -189,21 +190,39 @@ class ProtocolEngineClient:
 
         return self._parse_state(self._request("undo"))
 
-    def search(self, depth: int = 4) -> ProtocolSearchResult:
-        """搜索当前历史局面，但不执行返回的最佳走法。"""
+    def search(
+        self, depth: int = 4, *, move_time_ms: int | None = None
+    ) -> ProtocolSearchResult:
+        """搜索当前历史局面，可限制总思考时间，但不执行最佳走法。"""
 
         if depth <= 0:
             raise ValueError("search depth must be positive")
-        response = self._request(f"go depth {depth}")
+        if move_time_ms is not None and move_time_ms <= 0:
+            raise ValueError("move time must be positive")
+        command = f"go depth {depth}"
+        if move_time_ms is not None:
+            command += f" movetime {move_time_ms}"
+        response = self._request(command)
         fields = response.split()
-        if len(fields) != 8 or fields[0] != "bestmove":
+        if (
+            len(fields) != 10
+            or fields[0] != "bestmove"
+            or fields[2] != "score"
+            or fields[4] != "depth"
+            or fields[6] != "nodes"
+            or fields[8] != "timedout"
+        ):
             raise ProtocolError(f"invalid search response: {response}")
         try:
+            timed_out = int(fields[9])
+            if timed_out not in {0, 1}:
+                raise ValueError("timedout must be zero or one")
             return ProtocolSearchResult(
                 best_move=None if fields[1] == "none" else fields[1],
                 score=int(fields[3]),
                 depth=int(fields[5]),
                 nodes=int(fields[7]),
+                timed_out=bool(timed_out),
             )
         except (ValueError, IndexError) as error:
             raise ProtocolError(f"invalid search response: {response}") from error

@@ -5,10 +5,14 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <stdexcept>
 
 namespace xiangqi {
 namespace {
+
+/// @brief 仅用于快速展开递归并回到迭代加深边界的内部超时信号。
+struct SearchTimeout final {};
 
 /// @brief 将无合法走法的节点转换为当前行棋方的失败分数。
 /// @param ply 当前节点距离根节点的半回合数。
@@ -53,6 +57,9 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
     if (limits.quiescence_depth < 0) {
         throw std::invalid_argument("quiescence depth cannot be negative");
     }
+    if (limits.time_limit_ms && *limits.time_limit_ms == 0) {
+        throw std::invalid_argument("search time limit must be positive");
+    }
 
     evaluation_state_ = evaluator_.create_state(history.position_);
     if (!evaluation_state_) {
@@ -66,6 +73,11 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
     tt_cutoffs_ = 0;
     tt_move_orderings_ = 0;
     pvs_researches_ = 0;
+    deadline_.reset();
+    if (limits.time_limit_ms) {
+        deadline_ = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(*limits.time_limit_ms);
+    }
     move_ordering_.clear();
     quiescence_depth_ = limits.quiescence_depth;
     use_transposition_table_ =
@@ -88,19 +100,26 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
         const std::uint64_t tt_cutoffs_before = tt_cutoffs_;
         const std::uint64_t tt_move_orderings_before = tt_move_orderings_;
         const std::uint64_t pvs_researches_before = pvs_researches_;
-        result = search_iteration(history, 0, limits.algorithm, std::nullopt);
-        result.iterations.push_back(IterationResult{
-            .depth = 0,
-            .best_move = result.best_move,
-            .score = result.score,
-            .nodes = nodes_ - nodes_before,
-            .beta_cutoffs = beta_cutoffs_ - cutoffs_before,
-            .quiescence_nodes = quiescence_nodes_ - qnodes_before,
-            .tt_hits = tt_hits_ - tt_hits_before,
-            .tt_cutoffs = tt_cutoffs_ - tt_cutoffs_before,
-            .tt_move_orderings = tt_move_orderings_ - tt_move_orderings_before,
-            .pvs_researches = pvs_researches_ - pvs_researches_before,
-        });
+        try {
+            result = search_iteration(history, 0, limits.algorithm, std::nullopt);
+        } catch (const SearchTimeout&) {
+            result.score = evaluation_state_->evaluate(history.position_);
+            result.timed_out = true;
+        }
+        if (!result.timed_out) {
+            result.iterations.push_back(IterationResult{
+                .depth = 0,
+                .best_move = result.best_move,
+                .score = result.score,
+                .nodes = nodes_ - nodes_before,
+                .beta_cutoffs = beta_cutoffs_ - cutoffs_before,
+                .quiescence_nodes = quiescence_nodes_ - qnodes_before,
+                .tt_hits = tt_hits_ - tt_hits_before,
+                .tt_cutoffs = tt_cutoffs_ - tt_cutoffs_before,
+                .tt_move_orderings = tt_move_orderings_ - tt_move_orderings_before,
+                .pvs_researches = pvs_researches_ - pvs_researches_before,
+            });
+        }
         result.nodes = nodes_;
         result.beta_cutoffs = beta_cutoffs_;
         result.quiescence_nodes = quiescence_nodes_;
@@ -121,8 +140,15 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
         const std::uint64_t tt_move_orderings_before = tt_move_orderings_;
         const std::uint64_t pvs_researches_before = pvs_researches_;
 
-        SearchResult iteration = search_iteration(
-            history, current_depth, limits.algorithm, previous_best);
+        SearchResult iteration;
+        try {
+            check_timeout(true);
+            iteration = search_iteration(
+                history, current_depth, limits.algorithm, previous_best);
+        } catch (const SearchTimeout&) {
+            result.timed_out = true;
+            break;
+        }
         result.best_move = iteration.best_move;
         result.score = iteration.score;
         result.depth = current_depth;
@@ -152,7 +178,28 @@ SearchResult Searcher::search(GameHistory& history, const SearchLimits& limits) 
     result.tt_cutoffs = tt_cutoffs_;
     result.tt_move_orderings = tt_move_orderings_;
     result.pvs_researches = pvs_researches_;
+    if (result.timed_out && !result.best_move) {
+        Position& position = history.position_;
+        std::vector<Move> moves = position.generate_legal_moves();
+        if (!moves.empty() && !adjudication_score(history, 0)) {
+            result.best_move = moves.front();
+            result.score = evaluation_state_->evaluate(position);
+        }
+    }
     return result;
+}
+
+void Searcher::check_timeout(bool force) const {
+    if (!deadline_) {
+        return;
+    }
+    constexpr std::uint64_t kClockCheckMask = 255;
+    if (!force && ((nodes_ + quiescence_nodes_) & kClockCheckMask) != 0) {
+        return;
+    }
+    if (std::chrono::steady_clock::now() >= *deadline_) {
+        throw SearchTimeout{};
+    }
 }
 
 void Searcher::push_search_move(GameHistory& history, Move move) {
@@ -180,6 +227,7 @@ void Searcher::pop_search_move(GameHistory& history) {
 SearchResult Searcher::search_iteration(GameHistory& history, int depth,
                                         SearchAlgorithm algorithm,
                                         std::optional<Move> previous_best) {
+    check_timeout(true);
     ++nodes_;
     SearchResult result;
     result.depth = depth;
@@ -226,18 +274,23 @@ SearchResult Searcher::search_iteration(GameHistory& history, int depth,
     for (Move move : moves) {
         push_search_move(history, move);
         int score = 0;
-        if (algorithm == SearchAlgorithm::Negamax) {
-            score = -negamax(history, depth - 1, 1);
-        } else if (first_move) {
-            // 主变化候选使用完整窗口，建立当前根节点的可靠 Alpha。
-            score = -alpha_beta(history, depth - 1, -beta, -alpha, 1);
-        } else {
-            // 后续着先用零窗口判断是否能够超过当前最佳分数。
-            score = -alpha_beta(history, depth - 1, -alpha - 1, -alpha, 1);
-            if (score > alpha && score < beta) {
-                ++pvs_researches_;
+        try {
+            if (algorithm == SearchAlgorithm::Negamax) {
+                score = -negamax(history, depth - 1, 1);
+            } else if (first_move) {
+                // 主变化候选使用完整窗口，建立当前根节点的可靠 Alpha。
                 score = -alpha_beta(history, depth - 1, -beta, -alpha, 1);
+            } else {
+                // 后续着先用零窗口判断是否能够超过当前最佳分数。
+                score = -alpha_beta(history, depth - 1, -alpha - 1, -alpha, 1);
+                if (score > alpha && score < beta) {
+                    ++pvs_researches_;
+                    score = -alpha_beta(history, depth - 1, -beta, -alpha, 1);
+                }
             }
+        } catch (...) {
+            pop_search_move(history);
+            throw;
         }
         pop_search_move(history);
 
@@ -262,6 +315,7 @@ SearchResult Searcher::search_iteration(GameHistory& history, int depth,
 }
 
 int Searcher::negamax(GameHistory& history, int depth, int ply) {
+    check_timeout();
     ++nodes_;
     Position& position = history.position_;
     std::vector<Move> moves = position.generate_legal_moves();
@@ -280,7 +334,13 @@ int Searcher::negamax(GameHistory& history, int depth, int ply) {
     int best_score = -kSearchInfinity;
     for (Move move : moves) {
         push_search_move(history, move);
-        const int score = -negamax(history, depth - 1, ply + 1);
+        int score = 0;
+        try {
+            score = -negamax(history, depth - 1, ply + 1);
+        } catch (...) {
+            pop_search_move(history);
+            throw;
+        }
         pop_search_move(history);
         best_score = std::max(best_score, score);
     }
@@ -288,6 +348,7 @@ int Searcher::negamax(GameHistory& history, int depth, int ply) {
 }
 
 int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, int ply) {
+    check_timeout();
     ++nodes_;
     Position& position = history.position_;
     std::vector<Move> moves = position.generate_legal_moves();
@@ -332,14 +393,19 @@ int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, i
         const bool quiet = is_empty(position.piece_at(move.to));
         push_search_move(history, move);
         int score = 0;
-        if (first_move) {
-            score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
-        } else {
-            score = -alpha_beta(history, depth - 1, -alpha - 1, -alpha, ply + 1);
-            if (score > alpha && score < beta) {
-                ++pvs_researches_;
+        try {
+            if (first_move) {
                 score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
+            } else {
+                score = -alpha_beta(history, depth - 1, -alpha - 1, -alpha, ply + 1);
+                if (score > alpha && score < beta) {
+                    ++pvs_researches_;
+                    score = -alpha_beta(history, depth - 1, -beta, -alpha, ply + 1);
+                }
             }
+        } catch (...) {
+            pop_search_move(history);
+            throw;
         }
         pop_search_move(history);
 
@@ -377,6 +443,7 @@ int Searcher::alpha_beta(GameHistory& history, int depth, int alpha, int beta, i
 }
 
 int Searcher::quiescence(GameHistory& history, int alpha, int beta, int ply, int qply) {
+    check_timeout();
     ++quiescence_nodes_;
     Position& position = history.position_;
 
@@ -419,7 +486,13 @@ int Searcher::quiescence(GameHistory& history, int alpha, int beta, int ply, int
     for (Move move : moves) {
         push_search_move(history, move);
         ++nodes_;
-        const int score = -quiescence(history, -beta, -alpha, ply + 1, qply + 1);
+        int score = 0;
+        try {
+            score = -quiescence(history, -beta, -alpha, ply + 1, qply + 1);
+        } catch (...) {
+            pop_search_move(history);
+            throw;
+        }
         pop_search_move(history);
 
         best_score = std::max(best_score, score);

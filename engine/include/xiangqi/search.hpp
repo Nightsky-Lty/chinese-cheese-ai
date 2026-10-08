@@ -6,6 +6,7 @@
 #include "xiangqi/transposition_table.hpp"
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -29,6 +30,7 @@ struct SearchLimits {
     SearchAlgorithm algorithm{SearchAlgorithm::AlphaBeta};
     int quiescence_depth{32}; ///< 静态搜索最大延伸半回合数；设为 0 可关闭延伸。
     bool use_transposition_table{true}; ///< 是否在 Alpha-Beta 中使用置换表。
+    std::optional<std::uint64_t> time_limit_ms{}; ///< 可选的总搜索时间上限，单位毫秒。
 };
 
 /// @brief 迭代加深中某一个完整深度的搜索结果。
@@ -57,6 +59,7 @@ struct SearchResult {
     std::uint64_t tt_cutoffs{0};       ///< 直接复用缓存边界返回的总次数。
     std::uint64_t tt_move_orderings{0}; ///< 使用缓存最佳着进行排序的总次数。
     std::uint64_t pvs_researches{0};    ///< 零窗口提高 Alpha 后执行完整重搜的总次数。
+    bool timed_out{false};              ///< 是否因时间上限中止了未完成的迭代。
     std::vector<IterationResult> iterations{}; ///< 按深度递增排列的完整迭代结果。
 };
 
@@ -105,6 +108,12 @@ private:
     TranspositionTable transposition_table_;
     MoveOrdering move_ordering_;
     std::optional<int> cached_quiescence_depth_{};
+    std::optional<std::chrono::steady_clock::time_point> deadline_{};
+
+    /// @brief 在搜索节点入口检查可选截止时间。
+    /// @param force 为 True 时不等待周期性节点间隔，立即读取时钟。
+    /// @throws 内部超时信号，最外层搜索会捕获并返回最后完整迭代。
+    void check_timeout(bool force = false) const;
 
     /// @brief 同步执行搜索走法并更新对局历史与评估状态。
     /// @param history 当前搜索路径。

@@ -156,15 +156,37 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (starts_with(line, "go depth ")) {
-                    const std::string depth_text = line.substr(std::string("go depth ").size());
-                    std::size_t consumed = 0;
-                    const int depth = std::stoi(depth_text, &consumed);
-                    if (consumed != depth_text.size() || depth <= 0) {
-                        respond("error invalid_depth depth must be a positive integer");
+                    const std::string parameters =
+                        line.substr(std::string("go depth ").size());
+                    std::istringstream input(parameters);
+                    int depth = 0;
+                    if (!(input >> depth) || depth <= 0) {
+                        respond("error invalid_search depth must be a positive integer");
+                        continue;
+                    }
+                    std::optional<std::uint64_t> time_limit_ms;
+                    std::string option;
+                    if (input >> option) {
+                        std::uint64_t milliseconds = 0;
+                        if (option != "movetime" || !(input >> milliseconds) ||
+                            milliseconds == 0) {
+                            respond(
+                                "error invalid_search movetime must be a positive integer");
+                            continue;
+                        }
+                        time_limit_ms = milliseconds;
+                    }
+                    std::string trailing;
+                    if (input >> trailing) {
+                        respond("error invalid_search unexpected search parameter");
                         continue;
                     }
                     const xiangqi::SearchResult result = searcher.search(
-                        history, xiangqi::SearchLimits{.depth = depth});
+                        history,
+                        xiangqi::SearchLimits{
+                            .depth = depth,
+                            .time_limit_ms = time_limit_ms,
+                        });
                     std::ostringstream output;
                     output << "bestmove ";
                     if (result.best_move) {
@@ -174,7 +196,8 @@ int main(int argc, char** argv) {
                     }
                     output << " score " << result.score
                            << " depth " << result.depth
-                           << " nodes " << result.nodes;
+                           << " nodes " << result.nodes
+                           << " timedout " << (result.timed_out ? 1 : 0);
                     respond(output.str());
                     continue;
                 }

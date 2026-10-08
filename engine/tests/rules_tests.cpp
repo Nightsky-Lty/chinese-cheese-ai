@@ -1099,6 +1099,29 @@ void test_iterative_deepening_results() {
            "per-iteration PVS re-search counts add up to the total");
 }
 
+void test_search_time_limit_restores_history() {
+    xiangqi::GameHistory history(Position::initial());
+    const Position original = history.position();
+    const std::uint64_t context_before = history.rule_context_hash();
+    xiangqi::Searcher searcher;
+    const xiangqi::SearchResult result = searcher.search(
+        history,
+        xiangqi::SearchLimits{
+            .depth = 64,
+            .algorithm = xiangqi::SearchAlgorithm::AlphaBeta,
+            .time_limit_ms = 1,
+        });
+
+    expect(result.timed_out, "a one-millisecond deep search reports timeout");
+    expect(result.best_move.has_value(),
+           "timed search returns a legal fallback or completed-iteration move");
+    expect(result.depth == static_cast<int>(result.iterations.size()),
+           "timed search reports only fully completed iterative depths");
+    expect(history.position() == original && history.ply_count() == 0 &&
+               history.rule_context_hash() == context_before,
+           "timeout unwinding restores board, history, and rule context");
+}
+
 void test_transposition_table_storage_and_replacement() {
     xiangqi::TranspositionTable table(1);
     table.new_search();
@@ -1368,6 +1391,7 @@ int main() {
     test_quiescence_avoids_poisoned_capture();
     test_quiescence_searches_check_evasions();
     test_iterative_deepening_results();
+    test_search_time_limit_restores_history();
     test_transposition_table_storage_and_replacement();
     test_search_uses_transposition_table();
     test_search_respects_terminal_history();
