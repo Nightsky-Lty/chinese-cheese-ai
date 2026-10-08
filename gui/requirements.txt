@@ -1,0 +1,13 @@
+# 跨平台截图与图像显示
+mss>=9.0
+numpy>=1.26
+opencv-python>=4.9
+
+# 跨平台鼠标控制
+pyautogui>=0.9.54
+
+# 系统窗口枚举与激活
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"
+pywin32>=306; sys_platform == "win32"

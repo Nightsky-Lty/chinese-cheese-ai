@@ -19,3 +19,8 @@ __pycache__/
 .pytest_cache/
 .venv/
 /training/runs/
+
+# GUI screenshots and local board calibration
+/gui/output/
+/gui/wechat_board.json
+/gui/templates/

@@ -11,8 +11,9 @@
 > 当前状态：规则引擎、手工评估、Negamax、Alpha-Beta/PVS、静态搜索、迭代加深、
 > 置换表、“三次重复、长将、长捉、无吃子”的简化裁决，以及 float32 NNUE
 > 前向推理、搜索内增量累加器、C++ 自我对弈数据生成和 Python 监督训练/导出
-> 流水线均已实现，并可自动连续执行多代训练；棋力对局晋升、大规模并行生成、
-> 量化优化和 GUI 自动操作尚未实现。
+> 流水线均已实现，并可自动连续执行多代训练。另有第一版跨平台 GUI 适配层，
+> 可枚举微信窗口、截图、标定棋盘、识别棋子、生成 FEN、调用 C++ 引擎分析并
+> 预览坐标；落子结果校验、棋力对局晋升、大规模并行生成和量化优化尚未实现。
 
 ## 项目结构
 
@@ -44,6 +45,16 @@ chinese-cheese-ai/
 │   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
 │   ├── examples/positions.fen        # 批量标注输入示例
 │   └── tests/                        # Python 训练端自动测试
+├── gui/
+│   ├── windows.py                    # macOS/Windows 窗口枚举与激活
+│   ├── capture.py                    # 跨平台窗口区域截图
+│   ├── geometry.py                   # 棋盘标定和引擎/屏幕坐标换算
+│   ├── control.py                    # 安全预览和鼠标点击
+│   ├── config.py                     # 标定配置持久化
+│   ├── recognition.py                # 棋子模板学习、识别、FEN 和叠加图
+│   ├── engine_client.py              # Python 到 C++ 引擎的只读分析桥接
+│   ├── cli.py                        # 截图、标定、识别和预览命令行
+│   └── tests/                        # GUI 坐标单元测试
 ├── .vscode/                          # VS Code 构建、测试和调试配置
 ├── CMakeLists.txt                    # CMake 构建配置
 ├── Makefile                          # Make 构建配置
@@ -54,7 +65,9 @@ chinese-cheese-ai/
 
 ```mermaid
 flowchart LR
-    UI["命令行 / 未来的 GUI 适配层"] --> GH["GameHistory 对局历史"]
+    UI["GUI 截图"] --> CV["棋子识别 / FEN"]
+    CV --> CLI["C++ 引擎 CLI"]
+    CLI --> GH["GameHistory 对局历史"]
     SEARCH["Searcher 搜索器"] --> GH
     GH --> POS["Position 规则与局面"]
     GH --> CA["CycleAdjudicator 循环裁决"]
@@ -66,6 +79,99 @@ flowchart LR
     DATA --> GH
     DATA --> JSONL["NNUE 训练 JSONL"]
 ```
+
+## GUI 适配层：微信窗口截图与棋盘坐标操作
+
+GUI 适配层使用 Python 实现，与 C++ 引擎保持隔离。macOS 通过 Quartz/Cocoa 和
+ApplicationServices 查找、按窗口 ID 截图并精确置顶目标窗口，即使微信被其他窗口
+遮挡也不会截到遮挡内容；Windows 通过 Win32 API 定位和激活窗口，并使用 `mss`
+截图。鼠标控制使用 `pyautogui`。棋盘四角保存为窗口内的归一化坐标，因此窗口平移
+以及等比例缩放后不需要重新标定。Retina 或 Windows DPI 导致截图像素与屏幕坐标
+不同的情况，也会在预览时按实际宽高比例换算。
+
+创建环境并安装依赖：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r gui/requirements.txt
+```
+
+Windows PowerShell 中将第二条命令改为：
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r gui\requirements.txt
+```
+
+macOS 需要在“系统设置 → 隐私与安全性”中，为实际启动 Python 的 Terminal、
+iTerm 或 IDE 开启“屏幕录制”和“辅助功能”，随后完全退出并重新打开该应用。
+Windows 如果微信以管理员身份运行，控制程序通常也需要相同权限级别。
+
+先在微信中打开象棋小程序，然后执行：
+
+```bash
+# 查看匹配窗口；有多个结果时记住左侧序号
+.venv/bin/python -m gui.cli windows --query 微信
+
+# 截图验证窗口选择，必要时通过 --index 1 选择第二个结果
+.venv/bin/python -m gui.cli capture --query 微信 --index 0
+
+# 依次点击棋盘左上、右上、右下、左下四个最外侧交叉点
+.venv/bin/python -m gui.cli calibrate --query 微信 --index 0 --orientation red-bottom
+
+# 在新截图中画出 b0c2 的起点、终点和箭头，不操作微信
+.venv/bin/python -m gui.cli preview --move b0c2
+
+# 默认只输出坐标，不点击第三方界面
+.venv/bin/python -m gui.cli move --move b0c2
+```
+
+如果自己位于黑方、棋盘在屏幕中旋转了 180°，标定时使用
+`--orientation black-bottom`。标定窗口按 `R` 可以清空重选，按 `Esc` 取消。
+代码仍保留显式 `--execute` 点击开关，供自建离线测试界面使用。微信规则可能将
+未经授权的自动化操作视为异常行为，因此默认工作流只截图、识别和提示走法，不在
+真实微信账号上使用该开关。
+
+### 棋子识别与引擎建议
+
+第一版识别器使用轻量传统视觉，不需要额外训练模型。先从一张同主题、同朝向的
+标准初始局面生成本地模板：
+
+```bash
+.venv/bin/python -m gui.cli learn-templates \
+  --image gui/output/window.png \
+  --output gui/templates/jj_default.npz
+```
+
+识别器在 90 个交叉点上先以 HSV 饱和度检测金色棋子外圈，再根据棋子中心颜色区分
+红黑阵营，最后只在对应阵营的七类灰度字形模板中执行归一化相关匹配。标定坐标本身
+已经处理棋盘朝向，因此输出可以直接按从黑方底线到红方底线的顺序压缩成 FEN。
+
+对一张本地截图进行离线识别，并调用现有 C++ 引擎搜索：
+
+```bash
+.venv/bin/python -m gui.cli recognize \
+  --image gui/output/after_move.png \
+  --side black \
+  --engine build/make/xiangqi_cli \
+  --depth 3 \
+  --json gui/output/recognized.json
+```
+
+省略 `--image` 时会只读截取当前匹配窗口。`--side` 必须显式指定，因为仅凭静态
+棋盘无法可靠判断当前轮到哪一方。任何低于置信度阈值的棋子都会标为 `?` 并阻止
+生成 FEN，避免把不可靠局面交给引擎。
+
+## 技术栈
+
+- 引擎：C++20、CMake/Make、Zobrist、Negamax、Alpha-Beta/PVS、NNUE。
+- 训练：Python、PyTorch、NumPy、JSONL、AdamW。
+- 图像处理：Python、OpenCV、NumPy、HSV 占位检测、模板相关匹配。
+- macOS：PyObjC、Quartz、Cocoa、ApplicationServices，支持按窗口 ID 截图和
+  `AXRaise` 精确置顶。
+- Windows：pywin32、Win32 窗口 API、`mss` 截图。
+- 输入控制：`pyautogui`，默认关闭真实点击。
+- 数据交换：FEN、JSON、NPZ、标准输入输出，以及自定义 `XQNNUEF1` 权重格式。
+- 测试：C++/CTest 与 Python `unittest`。
 
 ## 实现思路
 
@@ -348,6 +454,12 @@ MVV-LVA 和 SEE 使用手工
 - [x] VS Code 构建、测试和调试配置
 - [x] Perft、规则、历史裁决、评估和搜索自动测试
 - [x] Python 特征、反向传播、导出和跨语言推理测试
+- [x] macOS/Windows 微信窗口枚举、截图和激活适配
+- [x] 棋盘四角标定、DPI 坐标换算、走法预览和显式点击
+- [x] GUI 坐标与配置读写自动测试
+- [x] HSV 棋子占位检测、红黑分类和十四类模板识别
+- [x] 识别结果叠加图、FEN 生成和低置信度阻断
+- [x] 识别局面到 C++ 搜索器的只读分析桥接
 
 ## 尚未实现
 
@@ -359,7 +471,9 @@ MVV-LVA 和 SEE 使用手工
 - [ ] 真实棋谱解析与中残局数据补充
 - [ ] 候选模型对冠军模型的自动对局和统计晋升门禁
 - [ ] UCCI 等标准引擎通信协议
-- [ ] 棋盘识别、落子和 GUI 控制适配层
+- [ ] 自动判断当前行棋方、落子前后差分和落子结果校验
+- [ ] 多主题、多分辨率模板管理与神经网络视觉识别后端
+- [ ] 面向自建离线棋盘的安全连续对弈控制器
 
 当前 `Searcher` 同时支持从 `Position` 或带有真实对局路径的 `GameHistory` 开始
 搜索。需要依据此前棋谱裁决重复时，应使用后者；仅传入 `Position` 时，搜索器会
@@ -529,7 +643,8 @@ b0c2
 2. 完善着法排序和搜索剪枝，并加入时间管理，形成稳定的传统引擎基线。
 3. 为数据生成加入多进程分片、断点续写，并通过棋谱解析补充高质量中残局。
 4. 对训练模型进行量化和 SIMD 推理优化，并通过对局评估棋力。
-5. 定义稳定的引擎通信接口，再单独实现棋盘识别与 GUI 操作模块。
+5. 在现有截图到 FEN 链路上加入局面差分、行棋方判断和落子结果校验，并仅在自建
+   离线棋盘中测试连续控制。
 
 将规则引擎、AI 搜索和 GUI 自动化分层，可以让棋力逻辑不依赖某个具体界面，
 也便于分别测试、调优和替换各个模块。

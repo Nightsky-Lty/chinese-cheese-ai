@@ -9,7 +9,7 @@ CLI_SOURCE := engine/src/main.cpp
 DATA_CLI_SOURCE := engine/src/generate_data.cpp
 TEST_SOURCE := engine/tests/rules_tests.cpp
 
-.PHONY: all test python-test run clean
+.PHONY: all test python-test gui-test run clean
 
 all: $(BUILD_DIR)/xiangqi_cli $(BUILD_DIR)/xiangqi_generate_data $(BUILD_DIR)/xiangqi_rules_tests
 
@@ -30,6 +30,9 @@ test: $(BUILD_DIR)/xiangqi_rules_tests
 
 python-test: $(BUILD_DIR)/xiangqi_cli
 	python3 -m unittest discover -s training/tests -v
+
+gui-test:
+	python3 -m unittest discover -s gui/tests -v
 
 run: $(BUILD_DIR)/xiangqi_cli
 	./$(BUILD_DIR)/xiangqi_cli
