@@ -38,7 +38,9 @@ class FakeObserver:
         self.events = events
         self.board: BoardState | None = None
 
-    def process_board(self, _board: BoardState) -> ObserverEvent | None:
+    def process_board(
+        self, _board: BoardState, *, expected_move: str | None = None
+    ) -> ObserverEvent | None:
         if not self.events:
             return None
         event, next_side = self.events.pop(0)
@@ -96,6 +98,38 @@ class GameControllerTests(unittest.TestCase):
             [event.kind for event in events], ["opponent_move", "move_requested"]
         )
         self.assertEqual(requested, ["b0c2"])
+
+    def test_two_ply_recovery_confirms_ai_move_and_opponent_reply(self) -> None:
+        observer = FakeObserver(
+            "red",
+            [
+                (ObserverEvent("initialized", best_move="b0c2"), "red"),
+                (
+                    ObserverEvent(
+                        "moves",
+                        move="b9c7",
+                        moves=("b0c2", "b9c7"),
+                        best_move="h0g2",
+                    ),
+                    "red",
+                ),
+            ],
+        )
+        requested: list[str] = []
+        controller = GameController(
+            cast(GameObserver, observer), ai_side="red", move_executor=requested.append
+        )
+
+        controller.process_board(self.board)
+        events = controller.process_board(self.board)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["move_confirmed", "opponent_move", "move_requested"],
+        )
+        self.assertEqual([event.move for event in events], ["b0c2", "b9c7", "h0g2"])
+        self.assertEqual(requested, ["b0c2", "h0g2"])
+        self.assertEqual(controller.pending_move, "h0g2")
 
     def test_mismatched_executed_move_pauses_without_retry(self) -> None:
         observer = FakeObserver(
@@ -258,6 +292,40 @@ class GameControllerTests(unittest.TestCase):
             self.assertEqual(events[0].kind, "move_confirmed")
             self.assertEqual(controller.phase, ControllerPhase.WAITING_OPPONENT)
             self.assertEqual(client.state().ply, 1)
+
+    def test_real_observer_recovers_ai_move_and_fast_reply_together(self) -> None:
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        initial = BoardState.from_fen(INITIAL_FEN)
+        requested: list[str] = []
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=1, search_depth=1
+            )
+            controller = GameController(
+                observer, ai_side="red", move_executor=requested.append
+            )
+            controller.process_board(initial)
+            ai_move = requested[0]
+
+            client.play(ai_move)
+            reply = client.legal_moves()[0]
+            client.undo()
+            after_ai = apply_coordinate_move(initial, ai_move)
+            after_reply = apply_coordinate_move(after_ai, reply)
+
+            events = controller.process_board(after_reply)
+
+            self.assertEqual(
+                [event.kind for event in events[:2]],
+                ["move_confirmed", "opponent_move"],
+            )
+            self.assertEqual(events[0].move, ai_move)
+            self.assertEqual(events[1].move, reply)
+            self.assertEqual(client.state().ply, 2)
+            self.assertEqual(observer.board, after_reply)
+            self.assertEqual(observer.side_to_move, "red")
 
 
 if __name__ == "__main__":

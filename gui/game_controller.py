@@ -188,14 +188,20 @@ class GameController:
 
         if not self.active:
             return ()
-        return self._process_event(self.observer.process_recognition(result))
+        return self._process_event(
+            self.observer.process_recognition(
+                result, expected_move=self.pending_move
+            )
+        )
 
     def process_board(self, board: BoardState) -> tuple[ControllerEvent, ...]:
         """处理一帧测试棋盘，并返回本帧产生的全部控制事件。"""
 
         if not self.active:
             return ()
-        return self._process_event(self.observer.process_board(board))
+        return self._process_event(
+            self.observer.process_board(board, expected_move=self.pending_move)
+        )
 
     def _process_event(
         self, event: ObserverEvent | None
@@ -252,7 +258,49 @@ class GameController:
             )
 
         emitted: list[ControllerEvent] = []
-        if event.kind == "move":
+        if event.kind == "moves":
+            moves = event.moves
+            if (
+                self.pending_move is None
+                or len(moves) != 2
+                or moves[0] != self.pending_move
+            ):
+                reason = "two-ply recovery does not match the pending GUI move"
+                self.phase = ControllerPhase.PAUSED
+                self.pause_reason = reason
+                self._pause_kind = PauseKind.MOVE_MISMATCH
+                self._paused_observer_event = event
+                return (
+                    ControllerEvent(
+                        "paused",
+                        self.phase,
+                        self.pending_move,
+                        reason,
+                        event,
+                        self._pause_kind,
+                    ),
+                )
+            confirmed, reply = moves
+            self.pending_move = None
+            self._confirmation_frames = 0
+            emitted.extend(
+                (
+                    ControllerEvent(
+                        "move_confirmed",
+                        self.phase,
+                        confirmed,
+                        observer_event=event,
+                    ),
+                    ControllerEvent(
+                        "opponent_move",
+                        self.phase,
+                        reply,
+                        "recovered together with the preceding AI move",
+                        event,
+                    ),
+                )
+            )
+        elif event.kind == "move":
             if self.pending_move is not None:
                 if event.move != self.pending_move:
                     reason = (

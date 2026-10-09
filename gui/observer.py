@@ -16,6 +16,7 @@ class ObserverEvent:
     kind: str
     fen: str | None = None
     move: str | None = None
+    moves: tuple[str, ...] = ()
     best_move: str | None = None
     score: int | None = None
     depth: int | None = None
@@ -94,13 +95,34 @@ class GameObserver:
             "reason": result.reason,
         }
 
-    def process_recognition(self, result: RecognitionResult) -> ObserverEvent | None:
-        """提交单帧识别结果；尚未稳定时返回 None。"""
+    def process_recognition(
+        self,
+        result: RecognitionResult,
+        *,
+        expected_move: str | None = None,
+    ) -> ObserverEvent | None:
+        """提交单帧识别结果；可用待确认走法追赶跨过的对手应手。
 
-        return self.process_board(BoardState.from_recognition(result))
+        参数:
+            result: 当前截图的棋盘识别结果。
+            expected_move: GUI 刚执行、但尚未被单独观察到的引擎走法。
+        """
 
-    def process_board(self, board: BoardState) -> ObserverEvent | None:
-        """提交单帧棋盘；稳定后初始化或验证一步真实走法。"""
+        return self.process_board(
+            BoardState.from_recognition(result), expected_move=expected_move
+        )
+
+    def process_board(
+        self,
+        board: BoardState,
+        *,
+        expected_move: str | None = None,
+    ) -> ObserverEvent | None:
+        """提交单帧棋盘；稳定后验证一步，必要时追赶连续两步。
+
+        当 ``expected_move`` 已由 GUI 点击，而首个稳定画面已经包含对手应手时，
+        观察器会依次验证该预期走法和唯一合法应手，并原子地推进两层历史。
+        """
 
         stable = self.stability.update(board)
         if stable is None:
@@ -129,6 +151,15 @@ class GameObserver:
                 self.engine.undo()
                 raise ValueError("engine state does not match the recognized board")
         except (ValueError, RuntimeError) as error:
+            if expected_move is not None:
+                try:
+                    return self._recover_expected_move_and_reply(
+                        previous, stable, expected_move
+                    )
+                except (ValueError, RuntimeError) as recovery_error:
+                    error = ValueError(
+                        f"{error}; two-ply recovery failed: {recovery_error}"
+                    )
             self.stability.restore_accepted(previous)
             return ObserverEvent(kind="rejected", message=str(error))
 
@@ -140,3 +171,84 @@ class GameObserver:
             move=detected.move,
             **self._current_event_fields(),
         )
+
+    def _recover_expected_move_and_reply(
+        self,
+        previous: BoardState,
+        stable: BoardState,
+        expected_move: str,
+    ) -> ObserverEvent:
+        """验证未单独观察到的预期走法及紧随其后的唯一合法应手。
+
+        参数:
+            previous: 最近一次已被引擎与视觉共同确认的棋盘。
+            stable: 当前稳定棋盘，预期已经包含连续两个半回合。
+            expected_move: GUI 已发送、正在等待确认的第一步。
+
+        任一步验证失败时会撤销本方法写入的全部引擎历史，保证恢复过程原子化。
+        """
+
+        legal_moves = set(self.engine.legal_moves())
+        if expected_move not in legal_moves:
+            raise ValueError(f"expected move {expected_move} is not legal")
+
+        played = 0
+        try:
+            first_state = self.engine.play(expected_move)
+            played = 1
+            intermediate = BoardState.from_fen(first_state.fen)
+            expected_board = self._apply_move(previous, expected_move)
+            if intermediate != expected_board:
+                raise ValueError("engine state does not match the expected GUI move")
+
+            reply_side = "black" if self.side_to_move == "red" else "red"
+            reply = detect_move(
+                intermediate,
+                stable,
+                reply_side,
+                self.engine.legal_moves(),
+            )
+            final_state = self.engine.play(reply.move)
+            played = 2
+            if BoardState.from_fen(final_state.fen) != stable:
+                raise ValueError("engine state does not match the recovered board")
+        except (ValueError, RuntimeError):
+            for _ in range(played):
+                self.engine.undo()
+            raise
+
+        self.board = stable
+        # 连续推进两个半回合后，行棋方与恢复前相同。
+        return ObserverEvent(
+            kind="moves",
+            fen=final_state.fen,
+            move=reply.move,
+            moves=(expected_move, reply.move),
+            **self._current_event_fields(),
+        )
+
+    @staticmethod
+    def _apply_move(board: BoardState, move: str) -> BoardState:
+        """在纯棋盘上应用四字符坐标走法，用于交叉验证引擎中间局面。"""
+
+        if len(move) != 4:
+            raise ValueError(f"invalid coordinate move: {move}")
+        source_file = ord(move[0]) - ord("a")
+        source_rank = ord(move[1]) - ord("0")
+        target_file = ord(move[2]) - ord("a")
+        target_rank = ord(move[3]) - ord("0")
+        if not (
+            0 <= source_file < 9
+            and 0 <= target_file < 9
+            and 0 <= source_rank < 10
+            and 0 <= target_rank < 10
+        ):
+            raise ValueError(f"invalid coordinate move: {move}")
+        source = source_rank * 9 + source_file
+        target = target_rank * 9 + target_file
+        pieces = list(board.pieces)
+        if pieces[source] == ".":
+            raise ValueError(f"expected move {move} starts from an empty square")
+        pieces[target] = pieces[source]
+        pieces[source] = "."
+        return BoardState(tuple(pieces))

@@ -178,7 +178,8 @@ def _print_controller_event(event: ControllerEvent, *, execute: bool) -> None:
         fen = event.observer_event.fen if event.observer_event is not None else None
         print(f"[initialized] {fen or 'board accepted'}")
     elif event.kind == "opponent_move":
-        print(f"[opponent] {event.move}")
+        recovered = " (two-ply recovery)" if event.message else ""
+        print(f"[opponent] {event.move}{recovered}")
     elif event.kind == "move_requested":
         action = "clicked" if execute else "preview-only"
         timeout = (
