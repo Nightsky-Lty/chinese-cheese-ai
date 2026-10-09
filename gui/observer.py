@@ -234,6 +234,22 @@ class GameObserver:
                     error = ValueError(
                         f"{error}; two-ply recovery failed: {recovery_error}"
                     )
+                if self._expected_move_endpoints_visible(
+                    previous, stable, expected_move
+                ):
+                    self.stability.restore_accepted(previous)
+                    if stable == self._last_transient_board:
+                        return None
+                    self._last_transient_board = stable
+                    detail = ", ".join(changes)
+                    return ObserverEvent(
+                        kind="transient",
+                        message=(
+                            f"expected {expected_move} is visible but the remaining "
+                            f"board is inconsistent; waiting: {detail}"
+                        ),
+                        changes=changes,
+                    )
             self.stability.restore_accepted(previous)
             self._last_transient_board = None
             detail = ", ".join(changes) if changes else "no square changes"
@@ -251,6 +267,26 @@ class GameObserver:
             fen=state.fen,
             move=detected.move,
             **self._current_event_fields(),
+        )
+
+    def _expected_move_endpoints_visible(
+        self, previous: BoardState, observed: BoardState, expected_move: str
+    ) -> bool:
+        """待确认着的起终点是否均已按预期变化，其余格仍可能在动画中。"""
+
+        if expected_move not in set(self.engine.legal_moves()):
+            return False
+        expected_board = self._apply_move(previous, expected_move)
+        changed = [
+            index
+            for index, (before, after) in enumerate(
+                zip(previous.pieces, expected_board.pieces)
+            )
+            if before != after
+        ]
+        return len(changed) == 2 and all(
+            observed.pieces[index] == expected_board.pieces[index]
+            for index in changed
         )
 
     def _recover_single_move_from_partial(

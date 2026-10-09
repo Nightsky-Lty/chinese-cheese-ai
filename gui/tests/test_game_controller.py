@@ -269,6 +269,29 @@ class GameControllerTests(unittest.TestCase):
         self.assertEqual(controller.phase, ControllerPhase.AWAITING_CONFIRMATION)
         self.assertEqual(controller.process_board(self.board)[0].kind, "move_confirmed")
 
+    def test_repeated_transient_frames_still_reach_confirmation_timeout(self) -> None:
+        """持续异常画面不能通过不断产生 transient 日志绕过帧数上限。"""
+
+        observer = FakeObserver(
+            "red",
+            [
+                (ObserverEvent("initialized", best_move="b0c2"), "red"),
+                (ObserverEvent("transient", message="animation"), "red"),
+                (ObserverEvent("transient", message="animation"), "red"),
+            ],
+        )
+        controller = GameController(
+            cast(GameObserver, observer),
+            ai_side="red",
+            move_executor=lambda _move: None,
+            confirmation_frame_limit=2,
+        )
+        controller.process_board(self.board)
+        self.assertEqual(controller.process_board(self.board)[0].kind, "transient")
+        events = controller.process_board(self.board)
+        self.assertEqual([event.kind for event in events], ["transient", "paused"])
+        self.assertEqual(controller.phase, ControllerPhase.PAUSED)
+
     def test_rejected_frame_can_resume_but_executor_failure_cannot(self) -> None:
         rejected = FakeObserver(
             "black",

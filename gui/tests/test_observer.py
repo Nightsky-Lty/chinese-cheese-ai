@@ -216,6 +216,40 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(client.state().ply, 0)
             self.assertEqual(observer.board, before)
 
+    def test_extra_animation_pieces_wait_instead_of_rejecting_expected_move(self) -> None:
+        """预期马步已出现、画面却多出两个兵时继续等待干净截图。"""
+
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        fen = "4k4/9/9/4p4/9/9/4N4/9/9/4K4 w"
+        initial = BoardState.from_fen(fen)
+        after_move = GameObserver._apply_move(initial, "e3f5")
+        pieces = list(after_move.pieces)
+        pieces[4 * 9 + 4] = "P"  # e4 动画误报。
+        pieces[5 * 9 + 4] = "P"  # e5 动画误报。
+        noisy = BoardState(tuple(pieces))
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=2, search_depth=1
+            )
+            observer.process_board(initial)
+            self.assertEqual(observer.process_board(initial).kind, "initialized")
+            self.assertIsNone(observer.process_board(noisy, expected_move="e3f5"))
+            transient = observer.process_board(noisy, expected_move="e3f5")
+            self.assertIsNotNone(transient)
+            assert transient is not None
+            self.assertEqual(transient.kind, "transient")
+            self.assertEqual(client.state().ply, 0)
+
+            self.assertIsNone(observer.process_board(after_move, expected_move="e3f5"))
+            confirmed = observer.process_board(after_move, expected_move="e3f5")
+            self.assertIsNotNone(confirmed)
+            assert confirmed is not None
+            self.assertEqual(confirmed.kind, "move")
+            self.assertEqual(confirmed.move, "e3f5")
+            self.assertEqual(client.state().ply, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

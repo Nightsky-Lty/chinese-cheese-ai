@@ -228,9 +228,18 @@ class GameController:
                 self._settling_move = None
                 self._settling_event = None
         if event is not None:
-            return self._handle_observer_event(event)
+            emitted = self._handle_observer_event(event)
+            if event.kind == "transient" and self.pending_move is not None:
+                return (*emitted, *self._tick_confirmation())
+            return emitted
         if self.pending_move is None:
             return ()
+        return self._tick_confirmation()
+
+    def _tick_confirmation(self) -> tuple[ControllerEvent, ...]:
+        """每张待确认画面都计入上限，包括产生 transient 日志的画面。"""
+
+        assert self.pending_move is not None
         self._confirmation_frames += 1
         if self._confirmation_frames < self.confirmation_frame_limit:
             return ()
