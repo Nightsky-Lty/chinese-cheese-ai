@@ -52,6 +52,30 @@ class BoardStateTests(unittest.TestCase):
         self.assertIsNone(detector.update(second))
         self.assertEqual(detector.update(second), second)
 
+    def test_stability_merges_compatible_unknown_squares(self) -> None:
+        complete = BoardState.from_fen(INITIAL_FEN)
+        first_pieces = list(complete.pieces)
+        second_pieces = list(complete.pieces)
+        first_pieces[0] = "?"
+        second_pieces[1] = "?"
+        first = BoardState(tuple(first_pieces))
+        second = BoardState(tuple(second_pieces))
+        detector = StableBoardDetector(required_frames=2)
+
+        self.assertIsNone(detector.update(first))
+        self.assertEqual(detector.update(second), complete)
+
+    def test_unknown_only_frame_does_not_replace_accepted_board(self) -> None:
+        complete = BoardState.from_fen(INITIAL_FEN)
+        partial_pieces = list(complete.pieces)
+        partial_pieces[0] = "?"
+        partial = BoardState(tuple(partial_pieces))
+        detector = StableBoardDetector(required_frames=1)
+
+        self.assertEqual(detector.update(complete), complete)
+        self.assertIsNone(detector.update(partial))
+        self.assertEqual(detector.accepted, complete)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -200,25 +200,48 @@ class StableBoardDetector:
         self._candidate_frames = 0
         self._accepted = board
 
-    def update(self, board: BoardState) -> BoardState | None:
-        """提交一帧；新棋盘首次达到稳定阈值时返回它，否则返回 None。"""
+    @staticmethod
+    def _compatible(first: BoardState, second: BoardState) -> bool:
+        """两个视觉棋盘在所有双方都已知的格子上是否一致。"""
 
-        if board.has_unknown:
+        return all(
+            left == "?" or right == "?" or left == right
+            for left, right in zip(first.pieces, second.pieces)
+        )
+
+    @staticmethod
+    def _merge(first: BoardState, second: BoardState) -> BoardState:
+        """合并兼容视觉棋盘，用任一帧的已知值补全另一帧的未知格。"""
+
+        return BoardState(
+            tuple(
+                right if left == "?" else left
+                for left, right in zip(first.pieces, second.pieces)
+            )
+        )
+
+    def update(self, board: BoardState) -> BoardState | None:
+        """提交一帧；新棋盘首次达到稳定阈值时返回它，否则返回 None。
+
+        稳定器只判断连续视觉结果是否相同，因此允许包含 ``?`` 的候选局面。未知格
+        是否足以恢复唯一合法走法由上层观察器结合规则判断。
+        """
+
+        if self._accepted is not None and self._compatible(board, self._accepted):
             self._candidate = None
             self._candidate_frames = 0
             return None
-        if board == self._accepted:
-            self._candidate = None
-            self._candidate_frames = 0
-            return None
-        if board == self._candidate:
+        if self._candidate is not None and self._compatible(board, self._candidate):
+            self._candidate = self._merge(self._candidate, board)
             self._candidate_frames += 1
         else:
             self._candidate = board
             self._candidate_frames = 1
         if self._candidate_frames < self.required_frames:
             return None
-        self._accepted = board
+        assert self._candidate is not None
+        accepted = self._candidate
+        self._accepted = accepted
         self._candidate = None
         self._candidate_frames = 0
-        return board
+        return accepted

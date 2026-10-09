@@ -12,6 +12,12 @@ from gui.protocol_client import ProtocolEngineClient
 
 INITIAL_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
 AFTER_HORSE = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1CN4C1/9/R1BAKABNR b"
+AFTER_CANNON_SETUP = (
+    "rnbakabnr/9/1c5c1/p3p1p1p/2p6/9/P1P1P1P1P/2C4C1/9/RNBAKABNR w"
+)
+AFTER_FAST_ROOK_REPLY = (
+    "rnbakabr1/9/1c5c1/p3p1p1p/2p6/9/P1P1P1P1P/2C6/9/RNBAKABNR w"
+)
 
 
 class ObserverTests(unittest.TestCase):
@@ -87,6 +93,31 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(accepted.kind, "move")
             self.assertEqual(accepted.move, "b0c2")
             self.assertEqual(client.state().ply, 1)
+
+    def test_partial_board_recovers_fast_overlapping_capture_reply(self) -> None:
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        initial = BoardState.from_fen(AFTER_CANNON_SETUP)
+        final = BoardState.from_fen(AFTER_FAST_ROOK_REPLY)
+        partial_pieces = list(final.pieces)
+        partial_pieces[9 * 9 + 7] = "?"  # h9 落子光效遮挡黑车。
+        partial = BoardState(tuple(partial_pieces))
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=1, search_depth=1
+            )
+            observer.process_board(initial)
+
+            recovered = observer.process_board(partial, expected_move="h2h9")
+
+            self.assertIsNotNone(recovered)
+            assert recovered is not None
+            self.assertEqual(recovered.kind, "moves")
+            self.assertEqual(recovered.moves, ("h2h9", "i9h9"))
+            self.assertEqual(observer.board, final)
+            self.assertEqual(observer.side_to_move, "red")
+            self.assertEqual(client.state().ply, 2)
 
 
 if __name__ == "__main__":

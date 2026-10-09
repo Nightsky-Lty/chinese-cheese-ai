@@ -132,6 +132,9 @@ class GameObserver:
         if stable is None:
             return None
         if self.board is None:
+            if stable.has_unknown:
+                self.stability.restore_accepted(None)
+                return None
             fen = stable.to_fen(self.side_to_move)
             state = self.engine.set_position(fen)
             self.board = stable
@@ -144,6 +147,30 @@ class GameObserver:
 
         previous = self.board
         changes = self._describe_changes(previous, stable)
+        if stable.has_unknown:
+            if expected_move is not None:
+                expected = self._recover_expected_move_from_partial(
+                    previous, stable, expected_move
+                )
+                if expected is not None:
+                    return expected
+                try:
+                    return self._recover_expected_move_and_reply(
+                        previous, stable, expected_move
+                    )
+                except (ValueError, RuntimeError):
+                    pass
+            self.stability.restore_accepted(previous)
+            if stable == self._last_transient_board:
+                return None
+            self._last_transient_board = stable
+            detail = ", ".join(changes) if changes else "unknown squares only"
+            return ObserverEvent(
+                kind="transient",
+                message=f"partial intermediate ignored: {detail}",
+                changes=changes,
+            )
+
         if len(changes) == 1:
             self.stability.restore_accepted(previous)
             if stable == self._last_transient_board:
@@ -226,30 +253,120 @@ class GameObserver:
                 raise ValueError("engine state does not match the expected GUI move")
 
             reply_side = "black" if self.side_to_move == "red" else "red"
-            reply = detect_move(
-                intermediate,
-                stable,
-                reply_side,
-                self.engine.legal_moves(),
-            )
-            final_state = self.engine.play(reply.move)
+            if stable.has_unknown:
+                reply_move = self._unique_partial_reply(
+                    previous,
+                    intermediate,
+                    stable,
+                    self.engine.legal_moves(),
+                )
+            else:
+                reply_move = detect_move(
+                    intermediate,
+                    stable,
+                    reply_side,
+                    self.engine.legal_moves(),
+                ).move
+            final_state = self.engine.play(reply_move)
             played = 2
-            if BoardState.from_fen(final_state.fen) != stable:
+            final_board = BoardState.from_fen(final_state.fen)
+            if not self._matches_observation(final_board, stable):
                 raise ValueError("engine state does not match the recovered board")
         except (ValueError, RuntimeError):
             for _ in range(played):
                 self.engine.undo()
             raise
 
-        self.board = stable
+        self.board = final_board
+        self.stability.restore_accepted(final_board)
         self._last_transient_board = None
         # 连续推进两个半回合后，行棋方与恢复前相同。
         return ObserverEvent(
             kind="moves",
             fen=final_state.fen,
-            move=reply.move,
-            moves=(expected_move, reply.move),
+            move=reply_move,
+            moves=(expected_move, reply_move),
             **self._current_event_fields(),
+        )
+
+    def _recover_expected_move_from_partial(
+        self,
+        previous: BoardState,
+        observed: BoardState,
+        expected_move: str,
+    ) -> ObserverEvent | None:
+        """在起点和终点均已知时，从部分视觉局面确认待执行的单步走法。"""
+
+        if expected_move not in set(self.engine.legal_moves()):
+            return None
+        expected_board = self._apply_move(previous, expected_move)
+        changed_indices = [
+            index
+            for index, (before, after) in enumerate(
+                zip(previous.pieces, expected_board.pieces)
+            )
+            if before != after
+        ]
+        if not all(observed.pieces[index] != "?" for index in changed_indices):
+            return None
+        if not self._matches_observation(expected_board, observed):
+            return None
+
+        state = self.engine.play(expected_move)
+        engine_board = BoardState.from_fen(state.fen)
+        if engine_board != expected_board:
+            self.engine.undo()
+            raise ValueError("engine state does not match the expected GUI move")
+        self.board = engine_board
+        self.stability.restore_accepted(engine_board)
+        self._last_transient_board = None
+        self.side_to_move = "black" if self.side_to_move == "red" else "red"
+        return ObserverEvent(
+            kind="move",
+            fen=state.fen,
+            move=expected_move,
+            **self._current_event_fields(),
+        )
+
+    def _unique_partial_reply(
+        self,
+        previous: BoardState,
+        intermediate: BoardState,
+        observed: BoardState,
+        legal_replies: tuple[str, ...] | set[str],
+    ) -> str:
+        """返回与部分视觉棋盘一致的唯一合法应手。
+
+        至少要求最终局面相对可信局面有两个已知变化格，防止仅凭一个动画格猜测。
+        """
+
+        candidates: list[str] = []
+        for move in legal_replies:
+            final_board = self._apply_move(intermediate, move)
+            if not self._matches_observation(final_board, observed):
+                continue
+            evidence = sum(
+                seen != "?" and before != after
+                for before, after, seen in zip(
+                    previous.pieces, final_board.pieces, observed.pieces
+                )
+            )
+            if evidence >= 2:
+                candidates.append(move)
+        if len(candidates) != 1:
+            raise ValueError(
+                "partial board does not identify exactly one legal reply "
+                f"(candidates={len(candidates)})"
+            )
+        return candidates[0]
+
+    @staticmethod
+    def _matches_observation(expected: BoardState, observed: BoardState) -> bool:
+        """未知格作为通配符时，完整引擎棋盘是否与视觉观察一致。"""
+
+        return all(
+            seen == "?" or actual == seen
+            for actual, seen in zip(expected.pieces, observed.pieces)
         )
 
     @staticmethod
