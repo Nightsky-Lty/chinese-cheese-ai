@@ -159,6 +159,63 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(recovered.moves, ("b2c2", "g9e7"))
             self.assertEqual(client.state().ply, 2)
 
+    def test_single_partial_frame_recovers_opponent_move_after_confirmation(self) -> None:
+        """提示圈遮住无关空格时，已知起终点仍能确认对手着法。"""
+
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        with ProtocolEngineClient(executable) as client:
+            client.set_position(INITIAL_FEN)
+            for move in ("b2c2", "c9e7", "c2c6", "h9i7", "h2i2"):
+                client.play(move)
+            before_reply = BoardState.from_fen(client.state().fen)
+            final = BoardState.from_fen(client.play("h7f7").fen)
+            client.undo()
+
+            observer = GameObserver(
+                client, initial_side="black", stable_frames=4, search_depth=1
+            )
+            observer.board = before_reply
+            observer.stability.restore_accepted(before_reply)
+
+            partial_pieces = list(final.pieces)
+            partial_pieces[9 * 9 + 2] = "?"  # c9 提示圈覆盖空格。
+            partial_pieces[9 * 9 + 7] = "?"  # h9 提示圈覆盖空格。
+            partial = BoardState(tuple(partial_pieces))
+
+            recovered = observer.process_board(partial)
+            self.assertIsNotNone(recovered)
+            assert recovered is not None
+            self.assertEqual(recovered.kind, "move")
+            self.assertEqual(recovered.move, "h7f7")
+            self.assertEqual(observer.board, final)
+            self.assertEqual(observer.side_to_move, "red")
+            self.assertEqual(client.state().ply, 6)
+
+    def test_partial_opponent_frame_needs_both_changed_squares(self) -> None:
+        """落点未知时仅凭起点消失，不应猜测对手走法。"""
+
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        with ProtocolEngineClient(executable) as client:
+            client.set_position(INITIAL_FEN)
+            before = BoardState.from_fen(client.state().fen)
+            final = BoardState.from_fen(client.play("b0c2").fen)
+            client.undo()
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=4, search_depth=1
+            )
+            observer.board = before
+            observer.stability.restore_accepted(before)
+            pieces = list(final.pieces)
+            pieces[2 * 9 + 2] = "?"  # c2 落点尚未识别。
+
+            self.assertIsNone(observer.process_board(BoardState(tuple(pieces))))
+            self.assertEqual(client.state().ply, 0)
+            self.assertEqual(observer.board, before)
+
 
 if __name__ == "__main__":
     unittest.main()

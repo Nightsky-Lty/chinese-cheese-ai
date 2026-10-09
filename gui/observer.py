@@ -142,6 +142,20 @@ class GameObserver:
             except (ValueError, RuntimeError):
                 pass
 
+        # AI 走法已经确认后，对手的落子提示圈仍可能把无关空格识别为 ?。
+        # 若一帧中已知的起点和终点足以唯一确定合法着，直接用完整引擎局面
+        # 补全这些未知格，避免一直等不到整张棋盘的稳定视觉结果。
+        if (
+            self.board is not None
+            and expected_move is None
+            and board.has_unknown
+            and board != self.board
+        ):
+            try:
+                return self._recover_single_move_from_partial(self.board, board)
+            except (ValueError, RuntimeError):
+                pass
+
         if self.board is not None and board == self.board:
             self._last_transient_board = None
         stable = self.stability.update(board)
@@ -236,6 +250,31 @@ class GameObserver:
             kind="move",
             fen=state.fen,
             move=detected.move,
+            **self._current_event_fields(),
+        )
+
+    def _recover_single_move_from_partial(
+        self, previous: BoardState, observed: BoardState
+    ) -> ObserverEvent:
+        """由单帧已知格唯一确认一步合法着，并补全无关未知格。"""
+
+        move = self._unique_partial_reply(
+            previous, previous, observed, self.engine.legal_moves()
+        )
+        state = self.engine.play(move)
+        final_board = BoardState.from_fen(state.fen)
+        if not self._matches_observation(final_board, observed):
+            self.engine.undo()
+            raise ValueError("engine state does not match the partial board")
+
+        self.board = final_board
+        self.stability.restore_accepted(final_board)
+        self._last_transient_board = None
+        self.side_to_move = "black" if self.side_to_move == "red" else "red"
+        return ObserverEvent(
+            kind="move",
+            fen=state.fen,
+            move=move,
             **self._current_event_fields(),
         )
 
