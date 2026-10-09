@@ -16,6 +16,7 @@ class ControllerPhase(str, Enum):
 
     WAITING_BOARD = "waiting_board"
     WAITING_OPPONENT = "waiting_opponent"
+    WAITING_RECOVERY_SETTLE = "waiting_recovery_settle"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
     PAUSED = "paused"
     FINISHED = "finished"
@@ -69,6 +70,7 @@ class GameController:
         ai_side: str,
         move_executor: MoveExecutor,
         confirmation_frame_limit: int = 30,
+        recovery_settle_frames: int = 0,
     ) -> None:
         """创建连续对局控制器。
 
@@ -77,6 +79,7 @@ class GameController:
             ai_side: 由引擎控制的一方，只能是 ``red`` 或 ``black``。
             move_executor: 接收四字符走法的单步执行函数；异常会令控制器暂停。
             confirmation_frame_limit: 请求落子后允许等待的最大识别帧数。
+            recovery_settle_frames: 双步恢复后，再次点击前要求的完整可信画面帧数。
         """
 
         normalized_side = ai_side.strip().lower()
@@ -84,16 +87,22 @@ class GameController:
             raise ValueError("AI side must be red or black")
         if confirmation_frame_limit <= 0:
             raise ValueError("confirmation frame limit must be positive")
+        if recovery_settle_frames < 0:
+            raise ValueError("recovery settle frame count must not be negative")
         self.observer = observer
         self.ai_side = normalized_side
         self.move_executor = move_executor
         self.confirmation_frame_limit = confirmation_frame_limit
+        self.recovery_settle_frames = recovery_settle_frames
         self.phase = ControllerPhase.WAITING_BOARD
         self.pending_move: str | None = None
         self.pause_reason: str | None = None
         self._confirmation_frames = 0
         self._pause_kind: PauseKind | None = None
         self._paused_observer_event: ObserverEvent | None = None
+        self._settling_move: str | None = None
+        self._settling_event: ObserverEvent | None = None
+        self._settled_frames = 0
 
     @property
     def active(self) -> bool:
@@ -188,10 +197,12 @@ class GameController:
 
         if not self.active:
             return ()
+        board = BoardState.from_recognition(result)
         return self._process_event(
             self.observer.process_recognition(
                 result, expected_move=self.pending_move
-            )
+            ),
+            board,
         )
 
     def process_board(self, board: BoardState) -> tuple[ControllerEvent, ...]:
@@ -200,14 +211,22 @@ class GameController:
         if not self.active:
             return ()
         return self._process_event(
-            self.observer.process_board(board, expected_move=self.pending_move)
+            self.observer.process_board(board, expected_move=self.pending_move),
+            board,
         )
 
     def _process_event(
-        self, event: ObserverEvent | None
+        self, event: ObserverEvent | None, board: BoardState
     ) -> tuple[ControllerEvent, ...]:
         """处理观察结果，并对未确认的执行走法实施帧数超时。"""
 
+        if self.phase == ControllerPhase.WAITING_RECOVERY_SETTLE:
+            if event is None:
+                return self._settle_recovered_board(board)
+            self._settled_frames = 0
+            if event.kind != "transient":
+                self._settling_move = None
+                self._settling_event = None
         if event is not None:
             return self._handle_observer_event(event)
         if self.pending_move is None:
@@ -232,6 +251,23 @@ class GameController:
                 pause_kind=self._pause_kind,
             ),
         )
+
+    def _settle_recovered_board(self, board: BoardState) -> tuple[ControllerEvent, ...]:
+        """双步恢复后，等完整可信棋盘连续出现再发下一次点击。"""
+
+        if board.has_unknown or board != self.observer.board:
+            self._settled_frames = 0
+            return ()
+        self._settled_frames += 1
+        if self._settled_frames < self.recovery_settle_frames:
+            return ()
+        move = self._settling_move
+        event = self._settling_event
+        assert move is not None and event is not None
+        self._settling_move = None
+        self._settling_event = None
+        self._settled_frames = 0
+        return self._request_move(move, event, [])
 
     def _handle_observer_event(
         self, event: ObserverEvent | None
@@ -387,10 +423,24 @@ class GameController:
             self.phase = ControllerPhase.AWAITING_CONFIRMATION
             return tuple(emitted)
 
+        if event.kind == "moves" and self.recovery_settle_frames:
+            self.phase = ControllerPhase.WAITING_RECOVERY_SETTLE
+            self._settling_move = event.best_move
+            self._settling_event = event
+            self._settled_frames = 0
+            return tuple(emitted)
+
+        return self._request_move(event.best_move, event, emitted)
+
+    def _request_move(
+        self, move: str, event: ObserverEvent, emitted: list[ControllerEvent]
+    ) -> tuple[ControllerEvent, ...]:
+        """发送一次待确认走法，失败时保持暂停且不自动重试。"""
+
         try:
-            self.move_executor(event.best_move)
+            self.move_executor(move)
         except Exception as error:
-            reason = f"move executor failed for {event.best_move}: {error}"
+            reason = f"move executor failed for {move}: {error}"
             self.phase = ControllerPhase.PAUSED
             self.pause_reason = reason
             self._pause_kind = PauseKind.EXECUTOR_FAILED
@@ -399,7 +449,7 @@ class GameController:
                 ControllerEvent(
                     "paused",
                     self.phase,
-                    event.best_move,
+                    move,
                     reason,
                     event,
                     self._pause_kind,
@@ -407,7 +457,7 @@ class GameController:
             )
             return tuple(emitted)
 
-        self.pending_move = event.best_move
+        self.pending_move = move
         self._confirmation_frames = 0
         self.phase = ControllerPhase.AWAITING_CONFIRMATION
         emitted.append(

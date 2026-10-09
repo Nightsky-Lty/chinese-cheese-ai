@@ -354,6 +354,12 @@ def build_parser() -> argparse.ArgumentParser:
     control.add_argument("--depth", type=int, default=4, help="引擎搜索深度")
     control.add_argument("--move-time-ms", type=int, help="每步最大搜索毫秒数")
     control.add_argument("--stable-frames", type=int, default=3, help="稳定帧门槛")
+    control.add_argument(
+        "--recovery-settle-frames",
+        type=int,
+        default=6,
+        help="双步恢复后再次点击前要求的完整可信帧数",
+    )
     control.add_argument("--interval", type=float, default=0.2, help="截图间隔秒数")
     control.add_argument("--click-interval", type=float, default=0.25, help="两次点击间隔")
     control.add_argument(
@@ -532,6 +538,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("repeat-each must be positive")
             if arguments.confirmation_frames <= 0:
                 raise ValueError("confirmation-frames must be positive")
+            if arguments.recovery_settle_frames < 0:
+                raise ValueError("recovery-settle-frames must not be negative")
             if arguments.move_time_ms is not None and arguments.move_time_ms <= 0:
                 raise ValueError("move-time-ms must be positive")
             if arguments.execute and not arguments.live:
@@ -590,6 +598,9 @@ def main(argv: list[str] | None = None) -> int:
                     ai_side=arguments.ai_side,
                     move_executor=execute_requested_move,
                     confirmation_frame_limit=arguments.confirmation_frames,
+                    recovery_settle_frames=(
+                        arguments.recovery_settle_frames if arguments.execute else 0
+                    ),
                 )
                 try:
                     while (

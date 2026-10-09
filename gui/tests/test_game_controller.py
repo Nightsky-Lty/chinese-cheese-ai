@@ -360,6 +360,86 @@ class GameControllerTests(unittest.TestCase):
             self.assertEqual(observer.board, after_reply)
             self.assertEqual(observer.side_to_move, "red")
 
+    def test_fast_reply_waits_for_complete_board_before_next_click(self) -> None:
+        """双步恢复时不能在首张动画画面上立刻发送下一着。"""
+
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        initial = BoardState.from_fen(INITIAL_FEN)
+        requested: list[str] = []
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=1, search_depth=1
+            )
+            controller = GameController(
+                observer,
+                ai_side="red",
+                move_executor=requested.append,
+                recovery_settle_frames=3,
+            )
+            controller.process_board(initial)
+            ai_move = requested[0]
+            after_ai = apply_coordinate_move(initial, ai_move)
+            client.play(ai_move)
+            reply = "b9c7"
+            self.assertIn(reply, client.legal_moves())
+            client.undo()
+            after_reply = apply_coordinate_move(after_ai, reply)
+
+            events = controller.process_board(after_reply)
+            self.assertEqual([event.kind for event in events], ["move_confirmed", "opponent_move"])
+            self.assertEqual(controller.phase, ControllerPhase.WAITING_RECOVERY_SETTLE)
+            self.assertEqual(requested, [ai_move])
+
+            self.assertEqual(controller.process_board(after_reply), ())
+            partial = list(after_reply.pieces)
+            partial[4 * 9 + 4] = "?"
+            self.assertEqual(controller.process_board(BoardState(tuple(partial))), ())
+            self.assertEqual(controller.process_board(after_reply), ())
+            self.assertEqual(controller.process_board(after_reply), ())
+            self.assertEqual(requested, [ai_move])
+
+            ready = controller.process_board(after_reply)
+            self.assertEqual(ready[-1].kind, "move_requested")
+            self.assertEqual(requested, [ai_move, ready[-1].move])
+
+    def test_unexpected_board_during_recovery_settle_pauses_before_click(self) -> None:
+        """恢复后的画面若与可信棋盘冲突，不能继续发送 AI 点击。"""
+
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        initial = BoardState.from_fen(INITIAL_FEN)
+        requested: list[str] = []
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=4, search_depth=1
+            )
+            controller = GameController(
+                observer,
+                ai_side="red",
+                move_executor=requested.append,
+                recovery_settle_frames=6,
+            )
+            for _ in range(4):
+                controller.process_board(initial)
+            ai_move = requested[0]
+            after_ai = apply_coordinate_move(initial, ai_move)
+            client.play(ai_move)
+            reply = "b9c7"
+            self.assertIn(reply, client.legal_moves())
+            client.undo()
+            after_reply = apply_coordinate_move(after_ai, reply)
+            controller.process_board(after_reply)
+
+            # 多出一手黑车移动，当前轮到红方，因此与可信历史冲突。
+            unexpected = apply_coordinate_move(after_reply, "a9c9")
+            for _ in range(4):
+                events = controller.process_board(unexpected)
+            self.assertEqual(events[-1].kind, "paused")
+            self.assertEqual(requested, [ai_move])
+
 
 if __name__ == "__main__":
     unittest.main()
