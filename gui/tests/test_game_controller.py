@@ -131,6 +131,48 @@ class GameControllerTests(unittest.TestCase):
         self.assertEqual(requested, ["b0c2", "h0g2"])
         self.assertEqual(controller.pending_move, "h0g2")
 
+    def test_corrected_reply_restarts_settle_before_next_click(self) -> None:
+        board = BoardState.from_fen(INITIAL_FEN)
+        observer = FakeObserver(
+            "red",
+            [
+                (ObserverEvent("initialized", best_move="b0c2"), "red"),
+                (
+                    ObserverEvent(
+                        "moves", move="b9c7", moves=("b0c2", "b9c7"),
+                        best_move="h0g2",
+                    ),
+                    "red",
+                ),
+                (
+                    ObserverEvent(
+                        "reply_corrected", move="b9a7",
+                        moves=("b9c7", "b9a7"), best_move="a0a1",
+                        message="corrected recovered reply b9c7 -> b9a7",
+                    ),
+                    "red",
+                ),
+            ],
+        )
+        requested: list[str] = []
+        controller = GameController(
+            cast(GameObserver, observer), ai_side="red",
+            move_executor=requested.append, recovery_settle_frames=2,
+        )
+        controller.process_board(board)
+        controller.process_board(board)
+        self.assertEqual(controller.phase, ControllerPhase.WAITING_RECOVERY_SETTLE)
+        self.assertEqual(requested, ["b0c2"])
+
+        corrected = controller.process_board(board)
+        self.assertEqual([event.kind for event in corrected], ["opponent_move_corrected"])
+        self.assertEqual(controller.phase, ControllerPhase.WAITING_RECOVERY_SETTLE)
+        self.assertEqual(requested, ["b0c2"])
+        self.assertEqual(controller.process_board(board), ())
+        ready = controller.process_board(board)
+        self.assertEqual(ready[-1].kind, "move_requested")
+        self.assertEqual(requested, ["b0c2", "a0a1"])
+
     def test_one_square_transient_keeps_waiting_without_reclicking(self) -> None:
         observer = FakeObserver(
             "red",
@@ -435,9 +477,11 @@ class GameControllerTests(unittest.TestCase):
             self.skipTest("xiangqi_protocol has not been built")
         initial = BoardState.from_fen(INITIAL_FEN)
         requested: list[str] = []
+        now = [0.0]
         with ProtocolEngineClient(executable) as client:
             observer = GameObserver(
-                client, initial_side="red", stable_frames=4, search_depth=1
+                client, initial_side="red", stable_frames=4, search_depth=1,
+                clock=lambda: now[0],
             )
             controller = GameController(
                 observer,
@@ -454,7 +498,12 @@ class GameControllerTests(unittest.TestCase):
             self.assertIn(reply, client.legal_moves())
             client.undo()
             after_reply = apply_coordinate_move(after_ai, reply)
+            for tick in (0.0, 0.1, 0.2, 0.3):
+                now[0] = tick
+                self.assertEqual(controller.process_board(after_reply), ())
+            now[0] = 0.4
             controller.process_board(after_reply)
+            self.assertEqual(controller.phase, ControllerPhase.WAITING_RECOVERY_SETTLE)
 
             # 多出一手黑车移动，当前轮到红方，因此与可信历史冲突。
             unexpected = apply_coordinate_move(after_reply, "a9c9")
@@ -462,6 +511,8 @@ class GameControllerTests(unittest.TestCase):
                 events = controller.process_board(unexpected)
             self.assertEqual(events[-1].kind, "paused")
             self.assertEqual(requested, [ai_move])
+            self.assertEqual(client.state().ply, 2)
+            self.assertEqual(observer.board, after_reply)
 
 
 if __name__ == "__main__":

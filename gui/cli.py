@@ -180,6 +180,8 @@ def _print_controller_event(event: ControllerEvent, *, execute: bool) -> None:
     elif event.kind == "opponent_move":
         recovered = " (two-ply recovery)" if event.message else ""
         print(f"[opponent] {event.move}{recovered}")
+    elif event.kind == "opponent_move_corrected":
+        print(f"[corrected] {event.message}")
     elif event.kind == "move_requested":
         action = "clicked" if execute else "preview-only"
         timeout = (

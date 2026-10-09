@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from typing import Callable
 
 from .board_state import BoardState, StableBoardDetector, detect_move
 from .protocol_client import ProtocolEngineClient, ProtocolSearchResult
@@ -38,6 +40,7 @@ class GameObserver:
         stable_frames: int = 3,
         search_depth: int = 4,
         move_time_ms: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """创建只读观察器。
 
@@ -47,6 +50,7 @@ class GameObserver:
             stable_frames: 接受局面前要求的连续相同帧数。
             search_depth: 每次接受局面后用于提示走法的搜索深度。
             move_time_ms: 每次搜索的可选时间上限，单位毫秒。
+            clock: 单调时钟，供快速恢复候选的观察时间和测试使用。
         """
 
         side = initial_side.strip().lower()
@@ -63,6 +67,11 @@ class GameObserver:
         self.stability = StableBoardDetector(stable_frames)
         self.board: BoardState | None = None
         self._last_transient_board: BoardState | None = None
+        self._clock = clock
+        self._fast_candidate: tuple[str, str, str] | None = None
+        self._fast_candidate_frames = 0
+        self._fast_candidate_since = 0.0
+        self._recent_recovered_reply: tuple[BoardState, str] | None = None
 
     @staticmethod
     def _search_event_fields(
@@ -126,21 +135,29 @@ class GameObserver:
         观察器会依次验证该预期走法和唯一合法应手，并原子地推进两层历史。
         """
 
+        if expected_move is not None:
+            # 下一次 AI 点击已开始，旧双步恢复的更正窗口就此结束。
+            self._recent_recovered_reply = None
+
         # 对手可能在 AI 落子后立即应手，而落子光效又让相邻帧的视觉标签持续闪烁。
         # 在这种情况下，要求整个棋盘先连续稳定会永远到不了双步恢复。待确认走法
-        # 已知时，先逐帧尝试“预期走法 + 唯一合法应手”；严格规则匹配失败才回到
-        # 常规的多帧稳定流程。
+        # 已知时，先逐帧尝试“预期走法 + 唯一合法应手”。这里只暂存候选，
+        # 防止把车、炮行棋动画途中的合法中间格写入历史。
         if (
             self.board is not None
             and expected_move is not None
             and board != self.board
         ):
             try:
+                reply = self._preview_expected_reply(self.board, board, expected_move)
+            except (ValueError, RuntimeError):
+                self._clear_fast_candidate()
+            else:
+                if not self._fast_candidate_confirmed("two", expected_move, reply):
+                    return None
                 return self._recover_expected_move_and_reply(
                     self.board, board, expected_move
                 )
-            except (ValueError, RuntimeError):
-                pass
 
         # AI 走法已经确认后，对手的落子提示圈仍可能把无关空格识别为 ?。
         # 若一帧中已知的起点和终点足以唯一确定合法着，直接用完整引擎局面
@@ -152,12 +169,19 @@ class GameObserver:
             and board != self.board
         ):
             try:
-                return self._recover_single_move_from_partial(self.board, board)
+                move = self._unique_partial_reply(
+                    self.board, self.board, board, self.engine.legal_moves()
+                )
             except (ValueError, RuntimeError):
-                pass
+                self._clear_fast_candidate()
+            else:
+                if not self._fast_candidate_confirmed("one", "", move):
+                    return None
+                return self._recover_single_move_from_partial(self.board, board)
 
         if self.board is not None and board == self.board:
             self._last_transient_board = None
+            self._clear_fast_candidate()
         stable = self.stability.update(board)
         if stable is None:
             return None
@@ -169,6 +193,8 @@ class GameObserver:
             state = self.engine.set_position(fen)
             self.board = stable
             self._last_transient_board = None
+            self._clear_fast_candidate()
+            self._recent_recovered_reply = None
             return ObserverEvent(
                 kind="initialized",
                 fen=state.fen,
@@ -185,6 +211,14 @@ class GameObserver:
                 if expected is not None:
                     return expected
                 try:
+                    reply = self._preview_expected_reply(
+                        previous, stable, expected_move
+                    )
+                    if not self._fast_candidate_confirmed(
+                        "two", expected_move, reply
+                    ):
+                        self.stability.restore_accepted(previous)
+                        return None
                     return self._recover_expected_move_and_reply(
                         previous, stable, expected_move
                     )
@@ -227,6 +261,14 @@ class GameObserver:
         except (ValueError, RuntimeError) as error:
             if expected_move is not None:
                 try:
+                    reply = self._preview_expected_reply(
+                        previous, stable, expected_move
+                    )
+                    if not self._fast_candidate_confirmed(
+                        "two", expected_move, reply
+                    ):
+                        self.stability.restore_accepted(previous)
+                        return None
                     return self._recover_expected_move_and_reply(
                         previous, stable, expected_move
                     )
@@ -250,6 +292,11 @@ class GameObserver:
                         ),
                         changes=changes,
                     )
+            elif self._recent_recovered_reply is not None:
+                try:
+                    return self._correct_recovered_reply(stable)
+                except (ValueError, RuntimeError):
+                    pass
             self.stability.restore_accepted(previous)
             self._last_transient_board = None
             detail = ", ".join(changes) if changes else "no square changes"
@@ -261,11 +308,111 @@ class GameObserver:
 
         self.board = stable
         self._last_transient_board = None
+        self._clear_fast_candidate()
+        self._recent_recovered_reply = None
         self.side_to_move = "black" if self.side_to_move == "red" else "red"
         return ObserverEvent(
             kind="move",
             fen=state.fen,
             move=detected.move,
+            **self._current_event_fields(),
+        )
+
+    def _clear_fast_candidate(self) -> None:
+        """丢弃尚未确认的快速恢复候选。"""
+
+        self._fast_candidate = None
+        self._fast_candidate_frames = 0
+        self._fast_candidate_since = 0.0
+
+    def _fast_candidate_confirmed(
+        self, kind: str, expected_move: str, move: str
+    ) -> bool:
+        """要求同一走法跨帧出现，且动画有时间到达最终落点。"""
+
+        key = (kind, expected_move, move)
+        now = self._clock()
+        if key != self._fast_candidate:
+            self._fast_candidate = key
+            self._fast_candidate_frames = 1
+            self._fast_candidate_since = now
+        else:
+            self._fast_candidate_frames += 1
+        # stable_frames=1 主要用于离线单帧测试；实时模式通常为 3～4 帧。
+        minimum_seconds = 0.35 if self.stability.required_frames > 1 else 0.0
+        return (
+            self._fast_candidate_frames >= self.stability.required_frames
+            and now - self._fast_candidate_since >= minimum_seconds
+        )
+
+    def _preview_expected_reply(
+        self, previous: BoardState, observed: BoardState, expected_move: str
+    ) -> str:
+        """只推断双步恢复的应手，不提交历史或启动搜索。"""
+
+        if expected_move not in set(self.engine.legal_moves()):
+            raise ValueError(f"expected move {expected_move} is not legal")
+        first_state = self.engine.play(expected_move)
+        try:
+            intermediate = BoardState.from_fen(first_state.fen)
+            if intermediate != self._apply_move(previous, expected_move):
+                raise ValueError("engine state does not match the expected GUI move")
+            reply_side = "black" if self.side_to_move == "red" else "red"
+            if observed.has_unknown:
+                reply = self._unique_partial_reply(
+                    previous, intermediate, observed, self.engine.legal_moves()
+                )
+            else:
+                reply = detect_move(
+                    intermediate, observed, reply_side, self.engine.legal_moves()
+                ).move
+            if not self._matches_observation(
+                self._apply_move(intermediate, reply), observed
+            ):
+                raise ValueError("recovered reply does not match the observed board")
+            return reply
+        finally:
+            self.engine.undo()
+
+    def _correct_recovered_reply(self, observed: BoardState) -> ObserverEvent:
+        """在下一次点击前，用完整稳定棋盘更正误认的动画中间落点。"""
+
+        context = self._recent_recovered_reply
+        if context is None or observed.has_unknown:
+            raise ValueError("no complete recovered reply can be corrected")
+        intermediate, previous_reply = context
+        if BoardState.from_fen(self.engine.state().fen) != self.board:
+            raise ValueError("history no longer matches the recovered board")
+        restored = self.engine.undo()
+        if BoardState.from_fen(restored.fen) != intermediate:
+            self.engine.play(previous_reply)
+            raise ValueError("history before the recovered reply does not match")
+        try:
+            reply_side = "black" if self.side_to_move == "red" else "red"
+            corrected = detect_move(
+                intermediate, observed, reply_side, self.engine.legal_moves()
+            ).move
+            if corrected == previous_reply:
+                raise ValueError("the recovered reply has not changed")
+            state = self.engine.play(corrected)
+            if BoardState.from_fen(state.fen) != observed:
+                self.engine.undo()
+                raise ValueError("corrected reply does not match the observed board")
+        except (ValueError, RuntimeError):
+            self.engine.play(previous_reply)
+            raise
+
+        self.board = observed
+        self.stability.restore_accepted(observed)
+        self._last_transient_board = None
+        self._clear_fast_candidate()
+        self._recent_recovered_reply = (intermediate, corrected)
+        return ObserverEvent(
+            kind="reply_corrected",
+            fen=state.fen,
+            move=corrected,
+            moves=(previous_reply, corrected),
+            message=f"{previous_reply} -> {corrected}",
             **self._current_event_fields(),
         )
 
@@ -306,6 +453,8 @@ class GameObserver:
         self.board = final_board
         self.stability.restore_accepted(final_board)
         self._last_transient_board = None
+        self._clear_fast_candidate()
+        self._recent_recovered_reply = None
         self.side_to_move = "black" if self.side_to_move == "red" else "red"
         return ObserverEvent(
             kind="move",
@@ -371,6 +520,8 @@ class GameObserver:
         self.board = final_board
         self.stability.restore_accepted(final_board)
         self._last_transient_board = None
+        self._clear_fast_candidate()
+        self._recent_recovered_reply = (intermediate, reply_move)
         # 连续推进两个半回合后，行棋方与恢复前相同。
         return ObserverEvent(
             kind="moves",
@@ -411,6 +562,8 @@ class GameObserver:
         self.board = engine_board
         self.stability.restore_accepted(engine_board)
         self._last_transient_board = None
+        self._clear_fast_candidate()
+        self._recent_recovered_reply = None
         self.side_to_move = "black" if self.side_to_move == "red" else "red"
         return ObserverEvent(
             kind="move",

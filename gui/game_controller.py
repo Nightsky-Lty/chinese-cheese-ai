@@ -355,6 +355,32 @@ class GameController:
                     ),
                 )
             )
+        elif event.kind == "reply_corrected":
+            if self.pending_move is not None or len(event.moves) != 2:
+                reason = "recovered reply changed while another move was pending"
+                self.phase = ControllerPhase.PAUSED
+                self.pause_reason = reason
+                self._pause_kind = PauseKind.MOVE_MISMATCH
+                self._paused_observer_event = event
+                return (
+                    ControllerEvent(
+                        "paused",
+                        self.phase,
+                        self.pending_move,
+                        reason,
+                        event,
+                        self._pause_kind,
+                    ),
+                )
+            emitted.append(
+                ControllerEvent(
+                    "opponent_move_corrected",
+                    self.phase,
+                    event.move,
+                    event.message,
+                    event,
+                )
+            )
         elif event.kind == "move":
             if self.pending_move is not None:
                 if event.move != self.pending_move:
@@ -432,7 +458,7 @@ class GameController:
             self.phase = ControllerPhase.AWAITING_CONFIRMATION
             return tuple(emitted)
 
-        if event.kind == "moves" and self.recovery_settle_frames:
+        if event.kind in {"moves", "reply_corrected"} and self.recovery_settle_frames:
             self.phase = ControllerPhase.WAITING_RECOVERY_SETTLE
             self._settling_move = event.best_move
             self._settling_event = event

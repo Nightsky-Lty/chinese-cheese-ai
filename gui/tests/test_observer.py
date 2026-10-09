@@ -119,7 +119,7 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(observer.side_to_move, "red")
             self.assertEqual(client.state().ply, 2)
 
-    def test_single_clean_frame_recovers_amid_incompatible_animation_frames(self) -> None:
+    def test_repeated_clean_reply_recovers_amid_incompatible_animation_frames(self) -> None:
         executable = Path("build/make/xiangqi_protocol")
         if not executable.is_file():
             self.skipTest("xiangqi_protocol has not been built")
@@ -138,9 +138,11 @@ class ObserverTests(unittest.TestCase):
         final_pieces[7 * 9 + 4] = "b"  # e7 已识别到黑象
         final = BoardState(tuple(final_pieces))
 
+        now = [0.0]
         with ProtocolEngineClient(executable) as client:
             observer = GameObserver(
-                client, initial_side="red", stable_frames=4, search_depth=1
+                client, initial_side="red", stable_frames=4, search_depth=1,
+                clock=lambda: now[0],
             )
             for _ in range(3):
                 self.assertIsNone(observer.process_board(initial))
@@ -151,7 +153,12 @@ class ObserverTests(unittest.TestCase):
                 observer.process_board(artifact, expected_move="b2c2")
             )
 
-            # 无需等待四张完全一致的最终截图，唯一合法序列可在单帧确认。
+            # 快速恢复按走法而不是整张截图累计证据，单帧不提交历史。
+            for tick in (0.1, 0.2, 0.3, 0.4):
+                now[0] = tick
+                self.assertIsNone(observer.process_board(final, expected_move="b2c2"))
+                self.assertEqual(client.state().ply, 0)
+            now[0] = 0.5
             recovered = observer.process_board(final, expected_move="b2c2")
             self.assertIsNotNone(recovered)
             assert recovered is not None
@@ -159,12 +166,13 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(recovered.moves, ("b2c2", "g9e7"))
             self.assertEqual(client.state().ply, 2)
 
-    def test_single_partial_frame_recovers_opponent_move_after_confirmation(self) -> None:
-        """提示圈遮住无关空格时，已知起终点仍能确认对手着法。"""
+    def test_repeated_partial_frames_recover_opponent_move_after_confirmation(self) -> None:
+        """提示圈遮住无关空格时，相同走法跨帧出现后才能确认。"""
 
         executable = Path("build/make/xiangqi_protocol")
         if not executable.is_file():
             self.skipTest("xiangqi_protocol has not been built")
+        now = [0.0]
         with ProtocolEngineClient(executable) as client:
             client.set_position(INITIAL_FEN)
             for move in ("b2c2", "c9e7", "c2c6", "h9i7", "h2i2"):
@@ -174,7 +182,8 @@ class ObserverTests(unittest.TestCase):
             client.undo()
 
             observer = GameObserver(
-                client, initial_side="black", stable_frames=4, search_depth=1
+                client, initial_side="black", stable_frames=4, search_depth=1,
+                clock=lambda: now[0],
             )
             observer.board = before_reply
             observer.stability.restore_accepted(before_reply)
@@ -184,6 +193,11 @@ class ObserverTests(unittest.TestCase):
             partial_pieces[9 * 9 + 7] = "?"  # h9 提示圈覆盖空格。
             partial = BoardState(tuple(partial_pieces))
 
+            for tick in (0.0, 0.1, 0.2, 0.3):
+                now[0] = tick
+                self.assertIsNone(observer.process_board(partial))
+                self.assertEqual(client.state().ply, 5)
+            now[0] = 0.4
             recovered = observer.process_board(partial)
             self.assertIsNotNone(recovered)
             assert recovered is not None
@@ -192,6 +206,90 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(observer.board, final)
             self.assertEqual(observer.side_to_move, "red")
             self.assertEqual(client.state().ply, 6)
+
+    def test_rook_animation_intermediate_is_not_committed_as_two_ply_reply(self) -> None:
+        """黑车途经 c1、最终到 c4 吃兵时，不得提前确认 c0c1。"""
+
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        initial = BoardState.from_fen(
+            "4k4/9/9/9/4P4/2P6/P8/9/4K4/2r6 w"
+        )
+        after_ai = GameObserver._apply_move(initial, "a3a4")
+        intermediate = GameObserver._apply_move(after_ai, "c0c1")
+        final = GameObserver._apply_move(after_ai, "c0c4")
+        now = [0.0]
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=4, search_depth=1,
+                clock=lambda: now[0],
+            )
+            for _ in range(3):
+                self.assertIsNone(observer.process_board(initial))
+            self.assertEqual(observer.process_board(initial).kind, "initialized")
+
+            for tick in (0.0, 0.1, 0.2, 0.3):
+                now[0] = tick
+                self.assertIsNone(
+                    observer.process_board(intermediate, expected_move="a3a4")
+                )
+                self.assertEqual(client.state().ply, 0)
+
+            for tick in (0.4, 0.5, 0.6, 0.7):
+                now[0] = tick
+                self.assertIsNone(observer.process_board(final, expected_move="a3a4"))
+                self.assertEqual(client.state().ply, 0)
+            now[0] = 0.8
+            recovered = observer.process_board(final, expected_move="a3a4")
+            self.assertIsNotNone(recovered)
+            assert recovered is not None
+            self.assertEqual(recovered.moves, ("a3a4", "c0c4"))
+            self.assertEqual(client.state().ply, 2)
+            self.assertEqual(observer.board, final)
+
+    def test_stable_final_board_corrects_a_premature_rook_reply(self) -> None:
+        """中间格即使停留够久，也能在下一次 AI 点击前更正应手。"""
+
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        initial = BoardState.from_fen(
+            "4k4/9/9/9/4P4/2P6/P8/9/4K4/2r6 w"
+        )
+        after_ai = GameObserver._apply_move(initial, "a3a4")
+        intermediate = GameObserver._apply_move(after_ai, "c0c1")
+        final = GameObserver._apply_move(after_ai, "c0c4")
+        now = [0.0]
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=4, search_depth=1,
+                clock=lambda: now[0],
+            )
+            for _ in range(4):
+                observer.process_board(initial)
+            for tick in (0.0, 0.1, 0.2, 0.3):
+                now[0] = tick
+                self.assertIsNone(
+                    observer.process_board(intermediate, expected_move="a3a4")
+                )
+            now[0] = 0.4
+            first = observer.process_board(intermediate, expected_move="a3a4")
+            self.assertIsNotNone(first)
+            assert first is not None
+            self.assertEqual(first.moves, ("a3a4", "c0c1"))
+            self.assertEqual(client.state().ply, 2)
+
+            for _ in range(3):
+                self.assertIsNone(observer.process_board(final))
+            corrected = observer.process_board(final)
+            self.assertIsNotNone(corrected)
+            assert corrected is not None
+            self.assertEqual(corrected.kind, "reply_corrected")
+            self.assertEqual(corrected.moves, ("c0c1", "c0c4"))
+            self.assertEqual(observer.board, final)
+            self.assertEqual(client.state().ply, 2)
+            self.assertEqual(BoardState.from_fen(client.state().fen), final)
 
     def test_partial_opponent_frame_needs_both_changed_squares(self) -> None:
         """落点未知时仅凭起点消失，不应猜测对手走法。"""
