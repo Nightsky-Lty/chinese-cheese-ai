@@ -126,6 +126,22 @@ class GameObserver:
         观察器会依次验证该预期走法和唯一合法应手，并原子地推进两层历史。
         """
 
+        # 对手可能在 AI 落子后立即应手，而落子光效又让相邻帧的视觉标签持续闪烁。
+        # 在这种情况下，要求整个棋盘先连续稳定会永远到不了双步恢复。待确认走法
+        # 已知时，先逐帧尝试“预期走法 + 唯一合法应手”；严格规则匹配失败才回到
+        # 常规的多帧稳定流程。
+        if (
+            self.board is not None
+            and expected_move is not None
+            and board != self.board
+        ):
+            try:
+                return self._recover_expected_move_and_reply(
+                    self.board, board, expected_move
+                )
+            except (ValueError, RuntimeError):
+                pass
+
         if self.board is not None and board == self.board:
             self._last_transient_board = None
         stable = self.stability.update(board)

@@ -119,6 +119,46 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(observer.side_to_move, "red")
             self.assertEqual(client.state().ply, 2)
 
+    def test_single_clean_frame_recovers_amid_incompatible_animation_frames(self) -> None:
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        initial = BoardState.from_fen(INITIAL_FEN)
+        artifact_pieces = list(initial.pieces)
+        artifact_pieces[2 * 9 + 1] = "."  # b2
+        artifact_pieces[2 * 9 + 2] = "C"  # c2
+        artifact_pieces[5 * 9 + 2] = "r"  # c5 动画假棋子
+        artifact_pieces[6 * 9 + 1] = "?"  # b6 光效
+        artifact = BoardState(tuple(artifact_pieces))
+
+        final_pieces = list(initial.pieces)
+        final_pieces[2 * 9 + 1] = "."
+        final_pieces[2 * 9 + 2] = "C"
+        final_pieces[9 * 9 + 6] = "?"  # g9 源格仍被光效覆盖
+        final_pieces[7 * 9 + 4] = "b"  # e7 已识别到黑象
+        final = BoardState(tuple(final_pieces))
+
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=4, search_depth=1
+            )
+            for _ in range(3):
+                self.assertIsNone(observer.process_board(initial))
+            self.assertEqual(observer.process_board(initial).kind, "initialized")
+
+            # 动画假帧无法形成合法序列，也没有累计到四帧。
+            self.assertIsNone(
+                observer.process_board(artifact, expected_move="b2c2")
+            )
+
+            # 无需等待四张完全一致的最终截图，唯一合法序列可在单帧确认。
+            recovered = observer.process_board(final, expected_move="b2c2")
+            self.assertIsNotNone(recovered)
+            assert recovered is not None
+            self.assertEqual(recovered.kind, "moves")
+            self.assertEqual(recovered.moves, ("b2c2", "g9e7"))
+            self.assertEqual(client.state().ply, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
