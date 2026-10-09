@@ -281,8 +281,12 @@ class TemplatePieceRecognizer:
         radius = min(width, height) / 2.0
         ring = (distance > radius * 0.68) & (distance < radius * 0.98)
         core = distance < radius * 0.65
+        hue = hsv[:, :, 0]
         saturation = hsv[:, :, 1]
-        occupancy = float(np.mean(saturation[ring] > 60))
+        # JJ 棋子的外沿是金色；绿色选中圈和白色落子提示虽也会提高
+        # 饱和度，却不应被当成棋子。OpenCV 的 HSV 色相范围为 0～179。
+        golden_ring = (hue >= 8) & (hue <= 34) & (saturation > 60)
+        occupancy = float(np.mean(golden_ring[ring]))
         red_piece = float(np.mean(saturation[core])) > 90.0
         return occupancy, red_piece
 

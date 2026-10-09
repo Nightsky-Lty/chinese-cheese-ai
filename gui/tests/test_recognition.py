@@ -80,6 +80,16 @@ class RecognitionTests(unittest.TestCase):
         self.assertLess(center.y, grid_center.y)
         self.assertGreater(occupancy, recognizer.occupancy_threshold)
 
+    def test_green_highlight_ring_is_not_a_piece(self) -> None:
+        """高饱和的绿色选中圈不能触发金色棋子占位检测。"""
+
+        patch = np.zeros((65, 65, 3), dtype=np.uint8)
+        cv2.circle(patch, (32, 32), 27, (30, 255, 30), 7)
+
+        occupancy, _red_piece = TemplatePieceRecognizer._occupancy_and_side(patch)
+
+        self.assertLess(occupancy, 0.28)
+
 
 if __name__ == "__main__":
     unittest.main()
