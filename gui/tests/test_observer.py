@@ -45,6 +45,7 @@ class ObserverTests(unittest.TestCase):
         initial = BoardState.from_fen(INITIAL_FEN)
         noisy_pieces = list(initial.pieces)
         noisy_pieces[40] = "P"
+        noisy_pieces[41] = "P"
         noisy = BoardState(tuple(noisy_pieces))
         with ProtocolEngineClient(executable) as client:
             observer = GameObserver(
@@ -56,6 +57,36 @@ class ObserverTests(unittest.TestCase):
             assert rejected is not None
             self.assertEqual(rejected.kind, "rejected")
             self.assertEqual(client.state().ply, 0)
+
+    def test_observer_ignores_one_square_intermediate_then_accepts_move(self) -> None:
+        executable = Path("build/make/xiangqi_protocol")
+        if not executable.is_file():
+            self.skipTest("xiangqi_protocol has not been built")
+        initial = BoardState.from_fen(INITIAL_FEN)
+        intermediate_pieces = list(initial.pieces)
+        intermediate_pieces[1] = "."
+        intermediate = BoardState(tuple(intermediate_pieces))
+        moved = BoardState.from_fen(AFTER_HORSE)
+        with ProtocolEngineClient(executable) as client:
+            observer = GameObserver(
+                client, initial_side="red", stable_frames=1, search_depth=1
+            )
+            observer.process_board(initial)
+
+            transient = observer.process_board(intermediate)
+            self.assertIsNotNone(transient)
+            assert transient is not None
+            self.assertEqual(transient.kind, "transient")
+            self.assertEqual(transient.changes, ("b0 N->.",))
+            self.assertEqual(observer.board, initial)
+            self.assertEqual(client.state().ply, 0)
+
+            accepted = observer.process_board(moved)
+            self.assertIsNotNone(accepted)
+            assert accepted is not None
+            self.assertEqual(accepted.kind, "move")
+            self.assertEqual(accepted.move, "b0c2")
+            self.assertEqual(client.state().ply, 1)
 
 
 if __name__ == "__main__":

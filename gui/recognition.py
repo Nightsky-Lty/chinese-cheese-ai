@@ -187,12 +187,22 @@ def _crop_square(
 ) -> np.ndarray:
     """围绕中心裁剪正方形，靠近图像边界时使用反射填充。"""
 
+    center_x = round(center.x)
+    center_y = round(center.y)
+    height, width = image.shape[:2]
+    left = center_x - half_size
+    right = center_x + half_size + 1
+    top = center_y - half_size
+    bottom = center_y + half_size + 1
+    if left >= 0 and top >= 0 and right <= width and bottom <= height:
+        return image[top:bottom, left:right]
+
     padding = half_size + 2
     padded = cv2.copyMakeBorder(
         image, padding, padding, padding, padding, cv2.BORDER_REFLECT_101
     )
-    x = round(center.x) + padding
-    y = round(center.y) + padding
+    x = center_x + padding
+    y = center_y + padding
     return padded[
         y - half_size : y + half_size + 1,
         x - half_size : x + half_size + 1,
@@ -295,6 +305,65 @@ class TemplatePieceRecognizer:
             return "?", best_score
         return best_label, best_score
 
+    def _locate_piece_center(
+        self,
+        image: np.ndarray,
+        grid_center: Point,
+        occupancy_half_size: int,
+        spacing: float,
+    ) -> tuple[Point, float, bool]:
+        """在交叉点附近寻找金色圆环响应最高的实际棋子中心。
+
+        参数:
+            image: 当前窗口截图。
+            grid_center: 标定得到的固定棋盘交叉点。
+            occupancy_half_size: 占位检测图块的半边长。
+            spacing: 相邻棋盘交叉点的像素距离。
+
+        JJ 的选中棋子会略微浮起，因此固定中心检测可能把它误判为空位。搜索范围
+        限制在不足五分之一格内，不会越过到相邻棋盘交叉点。
+        """
+
+        centered_patch = _crop_square(image, grid_center, occupancy_half_size)
+        centered_occupancy, centered_red_piece = self._occupancy_and_side(
+            centered_patch
+        )
+        if centered_occupancy >= self.occupancy_threshold:
+            return grid_center, centered_occupancy, centered_red_piece
+
+        # 完全空白格不进行邻域搜索，避免棋盘边缘装饰被误认为浮起棋子。真正略微
+        # 偏移的棋子仍会在固定圆环内留下部分金色像素。
+        relocation_floor = self.occupancy_threshold * 0.25
+        if centered_occupancy < relocation_floor:
+            return grid_center, centered_occupancy, centered_red_piece
+
+        max_offset = max(2, round(spacing * 0.16))
+        half_offset = max(1, round(max_offset / 2))
+        horizontal_offsets = (-max_offset, 0, max_offset)
+        vertical_offsets = (
+            -max_offset,
+            -half_offset,
+            0,
+            half_offset,
+            max_offset,
+        )
+        best_center = grid_center
+        best_occupancy = centered_occupancy
+        best_red_piece = centered_red_piece
+        for vertical in vertical_offsets:
+            for horizontal in horizontal_offsets:
+                candidate = Point(
+                    grid_center.x + horizontal,
+                    grid_center.y + vertical,
+                )
+                patch = _crop_square(image, candidate, occupancy_half_size)
+                occupancy, red_piece = self._occupancy_and_side(patch)
+                if occupancy > best_occupancy:
+                    best_center = candidate
+                    best_occupancy = occupancy
+                    best_red_piece = red_piece
+        return best_center, best_occupancy, best_red_piece
+
     def recognize(
         self,
         image: np.ndarray,
@@ -308,9 +377,13 @@ class TemplatePieceRecognizer:
         observations: list[PieceObservation] = []
         for rank in range(10):
             for file_index in range(9):
-                center = _grid_pixel(calibration, image, file_index, rank)
-                occupancy_patch = _crop_square(image, center, occupancy_half_size)
-                occupancy, red_piece = self._occupancy_and_side(occupancy_patch)
+                grid_center = _grid_pixel(calibration, image, file_index, rank)
+                center, occupancy, red_piece = self._locate_piece_center(
+                    image,
+                    grid_center,
+                    occupancy_half_size,
+                    spacing,
+                )
                 if occupancy < self.occupancy_threshold:
                     observations.append(
                         PieceObservation(file_index, rank, ".", 1.0, occupancy)

@@ -131,6 +131,39 @@ class GameControllerTests(unittest.TestCase):
         self.assertEqual(requested, ["b0c2", "h0g2"])
         self.assertEqual(controller.pending_move, "h0g2")
 
+    def test_one_square_transient_keeps_waiting_without_reclicking(self) -> None:
+        observer = FakeObserver(
+            "red",
+            [
+                (ObserverEvent("initialized", best_move="b0c2"), "red"),
+                (
+                    ObserverEvent(
+                        "transient",
+                        message="one-square intermediate ignored: b0 N->.",
+                        changes=("b0 N->.",),
+                    ),
+                    "red",
+                ),
+                (ObserverEvent("move", move="b0c2", best_move="b9c7"), "black"),
+            ],
+        )
+        requested: list[str] = []
+        controller = GameController(
+            cast(GameObserver, observer), ai_side="red", move_executor=requested.append
+        )
+
+        controller.process_board(self.board)
+        transient = controller.process_board(self.board)
+
+        self.assertEqual(transient[0].kind, "transient")
+        self.assertEqual(controller.phase, ControllerPhase.AWAITING_CONFIRMATION)
+        self.assertEqual(controller.pending_move, "b0c2")
+        self.assertEqual(requested, ["b0c2"])
+
+        confirmed = controller.process_board(self.board)
+        self.assertEqual(confirmed[0].kind, "move_confirmed")
+        self.assertEqual(requested, ["b0c2"])
+
     def test_mismatched_executed_move_pauses_without_retry(self) -> None:
         observer = FakeObserver(
             "red",

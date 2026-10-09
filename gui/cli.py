@@ -193,6 +193,8 @@ def _print_controller_event(event: ControllerEvent, *, execute: bool) -> None:
         )
     elif event.kind == "move_confirmed":
         print(f"[confirmed] {event.move}")
+    elif event.kind == "transient":
+        print(f"[transient] {event.message}")
     elif event.kind == "resumed":
         print(f"[resumed] {event.message}")
     elif event.kind == "observed_move_accepted":

@@ -240,6 +240,16 @@ class GameController:
 
         if event is None:
             return ()
+        if event.kind == "transient":
+            return (
+                ControllerEvent(
+                    "transient",
+                    self.phase,
+                    self.pending_move,
+                    event.message,
+                    event,
+                ),
+            )
         if event.kind == "rejected":
             reason = event.message or "recognized board was rejected"
             self.phase = ControllerPhase.PAUSED

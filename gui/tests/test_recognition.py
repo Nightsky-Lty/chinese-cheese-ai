@@ -7,8 +7,15 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import cv2
 
-from gui.recognition import PieceObservation, RecognitionResult, TemplateLibrary
+from gui.geometry import Point
+from gui.recognition import (
+    PieceObservation,
+    RecognitionResult,
+    TemplateLibrary,
+    TemplatePieceRecognizer,
+)
 
 
 def initial_result() -> RecognitionResult:
@@ -55,6 +62,23 @@ class RecognitionTests(unittest.TestCase):
             loaded = TemplateLibrary.load(path)
         for label in templates:
             np.testing.assert_array_equal(loaded.templates[label], templates[label])
+
+    def test_occupancy_center_follows_a_slightly_lifted_piece(self) -> None:
+        templates = {
+            label: np.zeros((1, 64, 64), dtype=np.uint8)
+            for label in "KABNRCPkabnrcp"
+        }
+        recognizer = TemplatePieceRecognizer(TemplateLibrary(templates))
+        image = np.zeros((200, 200, 3), dtype=np.uint8)
+        grid_center = Point(100, 100)
+        cv2.circle(image, (100, 90), 27, (0, 180, 220), 5)
+
+        center, occupancy, _red_piece = recognizer._locate_piece_center(
+            image, grid_center, occupancy_half_size=32, spacing=70
+        )
+
+        self.assertLess(center.y, grid_center.y)
+        self.assertGreater(occupancy, recognizer.occupancy_threshold)
 
 
 if __name__ == "__main__":

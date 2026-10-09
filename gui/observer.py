@@ -24,6 +24,7 @@ class ObserverEvent:
     outcome: str | None = None
     reason: str | None = None
     message: str | None = None
+    changes: tuple[str, ...] = ()
 
 
 class GameObserver:
@@ -61,6 +62,7 @@ class GameObserver:
         self.move_time_ms = move_time_ms
         self.stability = StableBoardDetector(stable_frames)
         self.board: BoardState | None = None
+        self._last_transient_board: BoardState | None = None
 
     @staticmethod
     def _search_event_fields(
@@ -124,6 +126,8 @@ class GameObserver:
         观察器会依次验证该预期走法和唯一合法应手，并原子地推进两层历史。
         """
 
+        if self.board is not None and board == self.board:
+            self._last_transient_board = None
         stable = self.stability.update(board)
         if stable is None:
             return None
@@ -131,6 +135,7 @@ class GameObserver:
             fen = stable.to_fen(self.side_to_move)
             state = self.engine.set_position(fen)
             self.board = stable
+            self._last_transient_board = None
             return ObserverEvent(
                 kind="initialized",
                 fen=state.fen,
@@ -138,6 +143,18 @@ class GameObserver:
             )
 
         previous = self.board
+        changes = self._describe_changes(previous, stable)
+        if len(changes) == 1:
+            self.stability.restore_accepted(previous)
+            if stable == self._last_transient_board:
+                return None
+            self._last_transient_board = stable
+            return ObserverEvent(
+                kind="transient",
+                message=f"one-square intermediate ignored: {changes[0]}",
+                changes=changes,
+            )
+
         try:
             detected = detect_move(
                 previous,
@@ -161,9 +178,16 @@ class GameObserver:
                         f"{error}; two-ply recovery failed: {recovery_error}"
                     )
             self.stability.restore_accepted(previous)
-            return ObserverEvent(kind="rejected", message=str(error))
+            self._last_transient_board = None
+            detail = ", ".join(changes) if changes else "no square changes"
+            return ObserverEvent(
+                kind="rejected",
+                message=f"{error}; changes: {detail}",
+                changes=changes,
+            )
 
         self.board = stable
+        self._last_transient_board = None
         self.side_to_move = "black" if self.side_to_move == "red" else "red"
         return ObserverEvent(
             kind="move",
@@ -218,6 +242,7 @@ class GameObserver:
             raise
 
         self.board = stable
+        self._last_transient_board = None
         # 连续推进两个半回合后，行棋方与恢复前相同。
         return ObserverEvent(
             kind="moves",
@@ -226,6 +251,22 @@ class GameObserver:
             moves=(expected_move, reply.move),
             **self._current_event_fields(),
         )
+
+    @staticmethod
+    def _describe_changes(
+        previous: BoardState, current: BoardState
+    ) -> tuple[str, ...]:
+        """返回形如 ``i9 r->.`` 的逐格变化描述，供过滤和诊断日志使用。"""
+
+        descriptions: list[str] = []
+        for index, (before, after) in enumerate(
+            zip(previous.pieces, current.pieces)
+        ):
+            if before == after:
+                continue
+            square = chr(ord("a") + index % 9) + str(index // 9)
+            descriptions.append(f"{square} {before}->{after}")
+        return tuple(descriptions)
 
     @staticmethod
     def _apply_move(board: BoardState, move: str) -> BoardState:
