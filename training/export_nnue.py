@@ -88,8 +88,14 @@ def export_model(model: HalfKANetwork, destination: str | Path) -> Path:
                 (HIDDEN_SIZE, ACCUMULATOR_SIZE * 2),
             )
         )
-        stream.write(_float32_bytes(model.output.bias, (1,)))
-        stream.write(_float32_bytes(model.output.weight, (1, HIDDEN_SIZE)))
+        # C++ 推理只认识引擎分数。仅末层线性参数需要从训练单位还原；
+        # 旧检查点的 score_scale=1，不会发生重复缩放。
+        stream.write(_float32_bytes(model.output.bias * model.score_scale, (1,)))
+        stream.write(
+            _float32_bytes(
+                model.output.weight * model.score_scale, (1, HIDDEN_SIZE)
+            )
+        )
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, destination)

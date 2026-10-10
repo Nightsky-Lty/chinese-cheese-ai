@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -586,6 +587,10 @@ void test_nnue_accumulator_and_forward_inference() {
 
 void test_nnue_incremental_accumulator_updates() {
     xiangqi::NnueNetwork network;
+    network.feature_biases()[0] = 0.5F;
+    network.hidden_weights()[0] = 0.7F;
+    network.hidden_weights()[xiangqi::kNnueAccumulatorSize] = 0.2F;
+    network.output_weights()[0] = 300.0F;
     for (std::size_t feature = 0;
          feature < xiangqi::kHalfKAFeatureDimensions; ++feature) {
         for (std::size_t neuron = 0; neuron < 4; ++neuron) {
@@ -613,6 +618,9 @@ void test_nnue_incremental_accumulator_updates() {
 
         expect(nnue_accumulators_match_refresh(network, state, position),
                description + " incremental update matches refresh");
+        expect(state.evaluate_for(position, position.side_to_move()) ==
+                   network.evaluate(position, position.side_to_move()),
+               description + " incremental score matches full evaluation");
         expect(state.stack_size() == 1,
                description + " stores one accumulator undo snapshot");
 
@@ -653,6 +661,9 @@ void test_nnue_incremental_accumulator_updates() {
         played.push_back(PlayedMove{candidate, undo});
         expect(nnue_accumulators_match_refresh(network, line_state, line),
                "multi-ply incremental accumulators match a full refresh");
+        expect(line_state.evaluate_for(line, line.side_to_move()) ==
+                   network.evaluate(line, line.side_to_move()),
+               "multi-ply incremental score matches full evaluation");
     }
     while (!played.empty()) {
         const PlayedMove last = played.back();
@@ -661,6 +672,9 @@ void test_nnue_incremental_accumulator_updates() {
         line.undo_move(last.move, last.undo);
         expect(nnue_accumulators_match_refresh(network, line_state, line),
                "multi-ply accumulator undo matches a full refresh");
+        expect(line_state.evaluate_for(line, line.side_to_move()) ==
+                   network.evaluate(line, line.side_to_move()),
+               "multi-ply undo score matches full evaluation");
     }
     expect(line == line_root && line_state.stack_size() == 0,
            "multi-ply accumulator stack returns exactly to its root");
@@ -678,6 +692,96 @@ void test_nnue_incremental_accumulator_updates() {
            "search can traverse multiple plies with incremental NNUE state");
     expect(position == search_root,
            "incremental NNUE search restores its root position");
+}
+
+void test_exported_nnue_incremental_smoke(const std::filesystem::path& path) {
+    const xiangqi::NnueNetwork network = xiangqi::NnueNetwork::load(path);
+    Position position = Position::initial();
+    const Position root = position;
+    xiangqi::NnueEvaluationState state(network, position);
+    float max_raw_drift = 0.0F;
+    int max_integer_drift = 0;
+    std::size_t score_checks = 0;
+    const auto raw_scores_match = [&]() {
+        for (Color perspective : {Color::Red, Color::Black}) {
+            const float full = network.forward(position, perspective);
+            const float incremental = network.forward_from_accumulators(
+                state.accumulator(Color::Red),
+                state.accumulator(Color::Black), perspective);
+            const float drift = std::abs(full - incremental);
+            const float tolerance = 0.001F + 1.0e-6F * std::abs(full);
+            max_raw_drift = std::max(max_raw_drift, drift);
+            ++score_checks;
+            if (drift > tolerance) {
+                std::cerr << "raw score drift=" << std::abs(full - incremental)
+                          << " full=" << full << " incremental=" << incremental
+                          << '\n';
+                return false;
+            }
+            const int full_integer = network.evaluate(position, perspective);
+            const int incremental_integer = network.evaluate_from_accumulators(
+                state.accumulator(Color::Red),
+                state.accumulator(Color::Black), perspective);
+            const int integer_drift = std::abs(full_integer - incremental_integer);
+            max_integer_drift = std::max(max_integer_drift, integer_drift);
+            if (integer_drift > 1) {
+                std::cerr << "integer score drift=" << integer_drift
+                          << " full=" << full_integer
+                          << " incremental=" << incremental_integer << '\n';
+                return false;
+            }
+        }
+        return true;
+    };
+
+    expect(nnue_accumulators_match_refresh(network, state, position),
+           "exported model starts with refreshed accumulators");
+    expect(raw_scores_match(), "exported model starts with matching raw scores");
+
+    struct PlayedMove {
+        Move move{};
+        xiangqi::UndoInfo undo{};
+        xiangqi::NnueAccumulator red_before{};
+        xiangqi::NnueAccumulator black_before{};
+    };
+    std::vector<PlayedMove> played;
+    for (std::size_t ply = 0; ply < 32; ++ply) {
+        const std::vector<Move> legal = position.generate_legal_moves();
+        if (legal.empty()) {
+            break;
+        }
+        const Move selected = legal[(ply * 17U + 5U) % legal.size()];
+        const xiangqi::Piece moved = position.piece_at(selected.from);
+        const xiangqi::Piece captured = position.piece_at(selected.to);
+        const xiangqi::NnueAccumulator red_before = state.accumulator(Color::Red);
+        const xiangqi::NnueAccumulator black_before = state.accumulator(Color::Black);
+        const xiangqi::UndoInfo undo = position.do_move(selected);
+        state.push_move(position, selected, moved, captured);
+        played.push_back(PlayedMove{selected, undo, red_before, black_before});
+        expect(nnue_accumulators_match_refresh(network, state, position),
+               "exported model move matches a full accumulator refresh");
+        expect(raw_scores_match(),
+               "exported model move matches the full raw NNUE score");
+    }
+
+    while (!played.empty()) {
+        const PlayedMove last = played.back();
+        played.pop_back();
+        state.pop_move();
+        position.undo_move(last.move, last.undo);
+        expect(state.accumulator(Color::Red) == last.red_before &&
+                   state.accumulator(Color::Black) == last.black_before,
+               "exported model undo exactly restores accumulator snapshots");
+        expect(nnue_accumulators_match_refresh(network, state, position),
+               "exported model undo matches a full accumulator refresh");
+        expect(raw_scores_match(),
+               "exported model undo restores the full raw NNUE score");
+    }
+    expect(position == root && state.stack_size() == 0,
+           "exported model smoke line returns to its root position");
+    std::cout << "exported NNUE incremental smoke: " << score_checks
+              << " raw score checks, max drift=" << max_raw_drift
+              << ", max integer drift=" << max_integer_drift << '\n';
 }
 
 void test_search_maintains_evaluation_state() {
@@ -1352,7 +1456,15 @@ void test_training_data_selfplay() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    std::optional<std::filesystem::path> exported_nnue;
+    if (argc == 3 && std::string(argv[1]) == "--nnue") {
+        exported_nnue = std::filesystem::path(argv[2]);
+    } else if (argc != 1) {
+        std::cerr << "usage: xiangqi_rules_tests [--nnue MODEL]\n";
+        return EXIT_FAILURE;
+    }
+
     test_initial_position();
     test_make_and_undo();
     test_horse_leg();
@@ -1400,6 +1512,14 @@ int main() {
     test_transposition_table_separates_rule_contexts();
     test_training_data_phase_and_labeling();
     test_training_data_selfplay();
+    if (exported_nnue.has_value()) {
+        try {
+            test_exported_nnue_incremental_smoke(*exported_nnue);
+        } catch (const std::exception& error) {
+            std::cerr << "FAIL: exported NNUE smoke failed: " << error.what() << '\n';
+            ++failures;
+        }
+    }
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

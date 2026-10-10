@@ -16,7 +16,8 @@
 > 预览坐标。只读观察器还能以连续稳定帧推断合法走法，并通过常驻协议维护完整
 > `GameHistory`。连续控制器已支持单次落子请求、视觉结果确认、确认超时及异常
 > 安全暂停、分类诊断和显式人工恢复，搜索也可按每步毫秒预算中止当前迭代；棋力
-> 对局晋升、大规模并行生成和量化优化尚未实现。
+> 评测已支持固定开局换先、多对手、同深度/同时间预算及带不确定性区间的晋升门禁。
+> 当前仍不能据此宣称达到较高棋力；多进程并行生成和量化优化尚未实现。
 
 ## 项目结构
 
@@ -42,7 +43,11 @@ chinese-cheese-ai/
 │   ├── halfka.py                     # 与 C++ 一致的 HalfKA 特征编码
 │   ├── model.py                      # PyTorch NNUE 网络与稀疏批处理
 │   ├── dataset.py                    # JSONL 训练样本加载
+│   ├── partition.py                  # 按对局划分、固定测试清单和镜像隔离
+│   ├── diagnostics.py                # 分项损失、评分分布和激活饱和率
 │   ├── train.py                      # 训练、验证、检查点和续训
+│   ├── arena.py                      # 多对手、换先和固定预算对战评测
+│   ├── baseline.py                   # 可信教师数据的基线训练与晋升闭环
 │   ├── iterate.py                    # 多代数据生成、回放训练、导出和恢复
 │   ├── export_nnue.py                # 导出 XQNNUEF1 权重
 │   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
@@ -426,13 +431,26 @@ JSON Lines，每行至少包含 FEN 和当前行棋方视角的引擎分值：
 ```
 
 `score` 会被限制到 ±28000；可选的正数 `weight` 用于调整单条样本的损失权重。
-训练使用带样本权重的 Smooth L1 损失和 AdamW，检查点保存模型、优化器、轮次、
-验证损失及架构元数据。导出器只提取推理参数，并按 C++ 已实现的 `XQNNUEF1`
-小端格式写出。
+训练使用带样本权重的 Smooth L1 损失和 AdamW。网络学习 `score / 600`，
+Huber 阈值也除以同一尺度；`score`、MAE 和诊断分位数仍用引擎分值表示。
+检查点记录模型、优化器、轮次、评分尺度/视角版本、真实分区指纹及配置。
+导出时仅将末层权重和偏置乘回尺度，C++ 无需再次缩放，权重仍使用 `XQNNUEF1`。
+旧 v1 检查点按尺度 1 解释，跨尺度迁移只换算一次末层，并重置优化器动量。
+
+训练/验证按“源批次＋对局 ID”分组；没有可靠对局 ID 时整文件分组。
+固定测试清单绑定源文件 SHA-256，源文件缺失或改变会拒绝训练；相同局面及水平镜像
+不会跨分区，后续回放也会剔除测试局面。固定测试集不用于选择 epoch，只在结束后
+评估验证集选中的最佳检查点一次。
+
+每轮诊断写入 `metrics.jsonl`，配置写入 `config.json`，最终指标写入 `report.json`：
+评分/赛果/总损失、引擎单位 MAE、预测及标签分位数、两层激活上下界饱和率，
+以及开中残局误差。未知赛果保持未知，不计入赛果监督。
 
 `verify_cpp.py` 会临时导出模型，针对相同 FEN 分别执行 PyTorch 和 C++ 原始
-float32 前向传播，然后检查误差是否在容差内。这可以尽早发现特征方向、矩阵转置、
-拼接顺序或权重排列不一致的问题。
+float32 前向传播，然后检查误差是否在容差内；默认绝对容差 `1e-3` 加相对容差
+`1e-6`，允许不同 float32 累加顺序的微小误差，但不允许整整一个引擎分值的偏差。
+可用 `--output-json` 保存验证证据。C++ 测试还支持 `xiangqi_rules_tests --nnue MODEL`，
+检查真实导出网络在走子、吃子、将帅移动及撤销后的增量/全量一致性。
 
 ### 6. 训练数据生成
 
@@ -454,18 +472,25 @@ NNUE，因此训练完成的上一代模型可以为下一代制造局面和监�
 生成器依据剩余非将帅子力将样本粗分为 `opening`、`middlegame` 和 `endgame`。
 自我对弈样本还会附带 `game`、`ply`，自然结束的对局会写入当前行棋方视角的
 最终 `result` 元数据；达到最大半回合数而截断的对局不会伪造和棋结果。
-Python 第一版训练器会忽略这些额外字段，后续可用于混合搜索分数与对局结果。
+Python 训练器可选择对已知赛果样本叠加赛果损失，未知赛果只参与评分损失。
 实际走子始终写入 `GameHistory`，因此三次重复、长将、长捉和 60 回合无吃子裁决
 会参与对局和搜索。历史规则导致的终局不会作为仅含棋盘特征的 NNUE 标签写入。
 
-`training.iterate` 把多代流程串成一个可恢复任务：每一代先用当前冠军生成新数据，
+`training.iterate` 把多代流程串成一个可恢复任务：默认先用手工教师生成新数据，
 再联合最近若干代数据进行回放训练，随后导出 C++ 权重并执行 Python/C++ 数值一致性
-验证。只有全部步骤成功才会原子更新 `state.json` 和稳定的 `champion.*` 文件；作业
-被 Slurm 超时终止后，使用相同工作目录重新运行即可从未完成代继续。
+验证。候选还需通过固定开局换先对弈门禁，才会原子更新 `state.json` 和稳定的
+`champion.*` 文件；失败候选保留在代次目录，旧冠军不变。作业被 Slurm 超时终止后，
+使用相同工作目录重新运行即可从未完成代继续。只有显式选择 `--label-teacher champion`
+才用冠军同时走棋和标注（当前生成器仍共用一个评估器），防止默认放大旧 NNUE 的错误标签。
+数据回放暂为最近若干代文件联合训练，按比例回放采样仍待实现。
 
-当前自动晋升只保证文件完整和跨语言推理一致，并没有证明候选棋力更强。正式多代
-训练前仍需实现候选模型与冠军模型的自动对局门禁；在此之前建议限制代数并人工检查
-每一代结果，避免把偶然退步无限放大。
+候选必须有验证/固定测试证据、Python/C++ 一致性结果，并通过 `training.arena`。
+手工评估器始终作为对手，可再加入当前冠军和固定历史模型；首个候选也没有免检晋升。
+默认 50 个不同开局各交换红黑，每对手 100 局。统计胜/和/负与未完成局，未完成不算和棋；
+保存完整走法、结束原因、协议记录、模型/引擎/开局哈希和预算配置。
+以完整换先开局对为统计簇，报告保守 95% Hoeffding 区间及诊断用 bootstrap 区间。
+晋升要求得分率及保守区间下界均达到阈值，且满足至少 100 局、50 个完整开局对的硬门槛。
+这些开局共享初始棋盘，不等于严格独立样本；报告明确注明该限制。
 
 ### 7. Negamax 与 Alpha-Beta/PVS 搜索
 
@@ -569,7 +594,14 @@ MVV-LVA 和 SEE 使用手工
 - [x] 带近似最佳开局随机性的完整自我对弈数据生成
 - [x] 局面阶段标记、哈希去重、极端分数过滤和对局结果元数据
 - [x] NNUE 教师自我对弈和最近多代数据回放
-- [x] 带原子状态、断点恢复、导出验证与自动晋升的迭代脚本
+- [x] 带原子状态、断点恢复、导出验证与基础对弈门禁的迭代脚本
+- [x] 归一化评分训练、检查点评分尺度元数据与导出还原
+- [x] 按整局拆分验证、固定测试集和跨分区镜像局面隔离
+- [x] 旧窄范围评分隔离、固定测试数据源哈希绑定
+- [x] 分项损失、引擎单位 MAE、分位数、激活饱和率和分阶段诊断
+- [x] 多对手固定开局换先、同深度/同时间评测与不确定性区间
+- [x] 验证、跨语言一致性及对战三门禁冠军晋升
+- [x] 从随机初始化重训可信教师基线的一键闭环
 - [x] 固定深度 Negamax
 - [x] Alpha-Beta 剪枝
 - [x] PVS 零窗口试探与必要的完整窗口重搜
@@ -613,7 +645,8 @@ MVV-LVA 和 SEE 使用手工
 - [ ] NNUE SIMD 与整数量化优化
 - [ ] 多进程分片生成、断点续写和大规模数据集管理
 - [ ] 真实棋谱解析与中残局数据补充
-- [ ] 候选模型对冠军模型的自动对局和统计晋升门禁
+- [ ] 更丰富且依赖更低的开局/中残局评测集与更精细的棋力统计
+- [ ] 固定教师、新数据与历史回放的受控比例采样
 - [ ] UCCI 等标准引擎通信协议
 - [ ] 窗口中断后的人工恢复（悔棋和重新开局同步暂缓实现）
 - [ ] 多主题、多分辨率模板管理与神经网络视觉识别后端
@@ -646,8 +679,9 @@ ctest --test-dir build --output-on-failure
 安装 Python 训练依赖并运行训练端测试：
 
 ```bash
-python3 -m pip install -r training/requirements.txt
-make python-test
+python3 -m venv .venv
+.venv/bin/python -m pip install -r training/requirements.txt
+.venv/bin/python -m unittest discover -s training/tests -v
 ```
 
 从纯文本 FEN 列表生成搜索标签：
@@ -680,7 +714,7 @@ make python-test
 从手工评估教师开始，自动运行三代小规模迭代：
 
 ```bash
-python3 -u -m training.iterate \
+.venv/bin/python -u -m training.iterate \
   --work-dir training/runs/iterations \
   --generations 3 \
   --games-per-generation 20 \
@@ -695,7 +729,7 @@ python3 -u -m training.iterate \
 如果要从已经完成的 `nnue-1` 开始，首次运行额外传入：
 
 ```bash
-python3 -u -m training.iterate \
+.venv/bin/python -u -m training.iterate \
   --work-dir training/runs/iterations \
   --generations 3 \
   --bootstrap-checkpoint training/runs/nnue-1/best.pt \
@@ -707,25 +741,129 @@ python3 -u -m training.iterate \
 `--work-dir`，不要再次传入 bootstrap 参数；脚本会读取 `state.json`，自动选择
 上一代不可变检查点和模型。服务器任务被中断后也使用同一条续跑命令。
 
-使用仓库中的微型示例验证训练闭环：
+无需本机教师数据即可检查训练、迁移、导出和跨语言代码：
 
 ```bash
-python3 -m training.train training/examples/tiny.jsonl \
-  --output-dir training/runs/example \
-  --epochs 1 \
-  --batch-size 2
-
-python3 -m training.export_nnue \
-  training/runs/example/best.pt \
-  training/runs/example/best.nnue
-
-python3 -m training.verify_cpp \
-  training/runs/example/best.pt \
-  --engine build/make/xiangqi_cli
+.venv/bin/python -m unittest training.tests.test_score_pipeline \
+  training.tests.test_arena_pipeline -v
 ```
 
-示例数据只用于检查代码能否运行，不能训练出具有棋力的模型。`--resume` 可从
+`tiny.jsonl` 是没有可靠对局分组的微型格式示例，不足以划分独立验证/测试集，
+不应作为完整基线流程的数据源。正式训练需要本机可信数据及对应固定清单；
+教师数据、模型和运行报告未提交到 Git。`--resume` 可从
 `latest.pt` 继续训练；`--epochs` 表示续训后希望达到的总轮次。
+
+训练数据可包含当前行棋方视角的 `"result"`：`1` 为胜、`0` 为和、`-1` 为负；
+缺失或 `null` 表示赛果未知，**不会被当作和棋**。启用赛果监督时，所有样本仍拟合
+`score`，只有赛果已知的样本额外参与赛果损失。
+
+训练时网络直接预测归一化评分，默认每 1 个输出单位对应 600 个引擎分值；
+`--huber-beta` 仍以引擎分值给出，内部会同步缩放。检查点记录尺度版本和当前行棋方
+视角；导出 `.nnue` 时只把末层还原为引擎分数。旧检查点按尺度 1 读取，跨尺度续训
+会换算末层并重置优化器状态，避免旧动量单位混用。已有
+`training/splits/hand-teacher-v2-test.json` 及其 `-sources.json` 侧车绑定当前教师批次，
+不要覆盖它们。如果是另一份数据，应在查看模型结果前一次性创建新的固定清单：
+
+```bash
+.venv/bin/python -m training.partition training/runs/my-teacher/*.jsonl \
+  --output training/runs/my-fixed-test.json
+```
+
+从随机初始化训练一份不继承旧模型的评分基线：
+
+```bash
+.venv/bin/python -m training.train training/runs/hand-teacher-v2/*.jsonl \
+  --output-dir training/runs/nnue-normalized-baseline \
+  --epochs 20 --score-scale 600
+```
+
+如使用自己的数据清单，训练命令另传 `--test-manifest training/runs/my-fixed-test.json`。
+运行目录保留 `metrics.jsonl` 和 `report.json`，可以对照评分尺度和测试误差。
+
+再试加入赛果监督时应使用**归一化损失单位**调节权重，例如：
+
+```bash
+.venv/bin/python -m training.train training/runs/hand-teacher-v2/*.jsonl \
+  --output-dir training/runs/nnue-with-results \
+  --resume training/runs/nnue-normalized-baseline/best.pt \
+  --reset-best --epochs 25 --learning-rate 0.0002 \
+  --outcome-weight 2.5 --outcome-scale 600
+```
+
+`--outcome-weight` 默认为 0，以保持旧训练和自动迭代流程的行为不变。
+旧 `iterations-20261009` 的 12 代数据中评分全部落在 −2～2；训练器按
+`training/splits/legacy-narrow-scores.json` 隔离这些标签，保留原始局面文件供重新标注。
+固定测试清单中的整盘对局不会参与训练，未来回放遇到相同或水平镜像局面也会移除。
+最佳 epoch 由整局分组验证集选择，固定测试集只在训练结束后报告。
+
+独立评测同一候选；历史对手可重复传入 `--history MODEL`：
+
+```bash
+.venv/bin/python -m training.arena \
+  --engine build/make/xiangqi_protocol \
+  --candidate training/runs/nnue-normalized-baseline/best.nnue \
+  --hand --search-mode depth --depth 2 \
+  --min-games 100 --min-independent-pairs 50 \
+  --output training/runs/nnue-normalized-baseline/arena-depth2.json
+```
+
+先导出候选 `.nnue`，或直接执行可信基线闭环：
+
+```bash
+.venv/bin/python -u -m training.baseline training/runs/hand-teacher-v2/*.jsonl \
+  --work-dir training/runs/baseline-next \
+  --epochs 20 --batch-size 512 --score-scale 600 --device cpu \
+  --search-mode time --depth 64 --time-limit-ms 150 \
+  --min-games 100 --min-independent-pairs 50
+```
+
+`baseline` 只训练纯评分基线，不继承旧权重；工作目录必须不存在。
+验证证据、导出一致性和每个对手的 arena 全部通过才创建 `champion.*`。
+门禁失败会以非零退出码结束，但候选、数据和失败报告仍保留，这是拒绝晋升而非训练丢失。
+自动迭代使用相同门禁，参数对应 `--arena-mode`、`--arena-depth`、
+`--arena-time-limit-ms`、`--arena-required-score`、`--arena-min-games`、
+`--arena-min-independent-pairs` 和 `--arena-max-unfinished`。
+三种 CLI 在 time 模式未指定深度时采用上限 64，depth 模式默认 4；显式深度始终保留。
+时间评测只保证相同每步预算，不保证跨机器或不同负载逐着完全复现。
+降低试跑局数不能降低正式晋升的 100 局/50 开局对硬门槛；评测文件默认不覆盖。
+
+### 第一轮基线验收（2026-10-10）
+
+保持 Alpha-Beta/PVS 和 HalfKA `256→32→1` 不变，没有增加数据或扩大网络。
+现有 13 批手工教师共 100,018 条样本：79,028 条训练、7,980 条验证、10,994 条固定测试，
+另剔除 2,016 条分区冲突或重复局面；分区间对局/镜像局面交集为零。
+旧 12 代共 73,559 条窄范围评分隔离，正常教师数据中的近零评分仍保留。
+随机初始化、CPU、纯评分监督训练 20 轮，最佳检查点由验证集选在第 7 轮。
+
+同一固定测试集上的误差（引擎分值，越低越好）：
+
+| 模型 | MAE |
+| --- | ---: |
+| 旧迭代冠军 | 561.28 |
+| 旧未归一化手工教师模型 | 381.26 |
+| 此前归一化基线 | 155.64 |
+| 本轮纯评分基线 | 152.87 |
+
+新预测 P05/P95 约为 −1203/+1150，不再挤在 −2～2；开局/中局/残局 MAE 分别为
+127.53/188.43/127.71。隐藏层上界饱和率约 25.59%，累加器上界饱和率约 `5.3e-7`。
+指标仅用于诊断，不证明棋力；固定测试对比未用于挑选本轮 epoch。
+Python/C++ 原始评分最大误差约 `0.000183`，真实导出网络 130 次增量/全量检查
+最大误差约 `0.000153`，撤销快照精确恢复。
+
+每对手 50 个开局交换红黑，共 100 局，最多 300 半步。
+对手工评估器的结果（均为候选视角，得分率不含未完成局）：
+
+| 预算 | 胜 | 和 | 负 | 未完成 | 得分率 | 配对开局保守 95% 区间 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 同深度 2 | 30 | 16 | 49 | 5 | 40.00% | 18.64%～59.13% |
+| 同时间 20ms，上限 64 | 28 | 5 | 61 | 6 | 32.45% | 11.91%～52.86% |
+
+虽然对旧 NNUE 有大幅改善，新模型仍未超过手工评估器，因此没有晋升或覆盖旧冠军。
+20ms 是本机短预算诊断，不能外推到 GUI 的 500ms 设置；配对区间还有共享开局根节点的
+相关性限制。下一实验只比较纯评分与加入赛果监督，不同时改搜索、特征或网络容量。
+本机证据保存在 `training/runs/first-round-score-baseline-20261010/`，包括
+`best.pt`、`best.nnue`、`metrics.jsonl`、`report.json`、`parity.json`、
+`arena-depth2.json`、`arena-time20ms.json` 和汇总 `acceptance.json`；它们不随 Git 推送。
 
 ## 命令行使用
 

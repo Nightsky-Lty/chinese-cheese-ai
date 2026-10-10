@@ -1,9 +1,10 @@
-"""自动执行自我对弈、回放训练、导出、验证和教师模型晋升。"""
+"""自动执行自我对弈、回放训练、导出、验证和有门禁的教师晋升。"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import shutil
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .checkpoint import load_checkpoint
+from .arena import DEFAULT_OPENINGS, Opponent, resolve_search_depth, run_arena
+from .partition import DEFAULT_QUARANTINE_MANIFEST, DEFAULT_TEST_MANIFEST
 
 
 STATE_FORMAT = "xiangqi-nnue-iteration-v1"
@@ -37,7 +40,7 @@ class IterationState:
     champion_epoch: int = 0
 
 
-def run_command(command: Sequence[str]) -> None:
+def run_command(command: Sequence[str]) -> bool:
     """在项目根目录执行一个子命令并实时继承标准输入输出。
 
     参数:
@@ -49,6 +52,7 @@ def run_command(command: Sequence[str]) -> None:
 
     print(f"\n$ {shlex.join(command)}", flush=True)
     subprocess.run(list(command), cwd=PROJECT_ROOT, check=True)
+    return True
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -81,6 +85,35 @@ def atomic_copy(source: Path, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     shutil.copyfile(source, temporary)
     os.replace(temporary, destination)
+
+
+def next_arena_report_path(directory: Path) -> Path:
+    """为每次评测分配新报告名，失败证据不会被静默覆盖。"""
+
+    first = directory / "arena.json"
+    if not first.exists() and not first.with_suffix(".json.tmp").exists():
+        return first
+    attempt = 2
+    while True:
+        path = directory / f"arena-attempt-{attempt:02d}.json"
+        if not path.exists() and not path.with_suffix(path.suffix + ".tmp").exists():
+            return path
+        attempt += 1
+
+
+def arena_opponents(
+    champion_model: Path | None, historical_models: Sequence[Path],
+) -> list[Opponent]:
+    """始终把手工评估放入门禁；冠军与历史网络只增加固定对手。"""
+
+    opponents = [Opponent("hand", None)]
+    if champion_model is not None:
+        opponents.append(Opponent("champion", champion_model))
+    opponents.extend(
+        Opponent(f"history-{index}", path)
+        for index, path in enumerate(historical_models, start=1)
+    )
+    return opponents
 
 
 def load_state(path: Path) -> IterationState:
@@ -123,6 +156,155 @@ def checkpoint_epoch(path: Path | None) -> int:
     if path is None:
         return 0
     return int(load_checkpoint(path, "cpu").get("epoch", 0))
+
+
+def candidate_validation_evidence(
+    report: dict[str, Any], checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind validation/test evidence to the exact best checkpoint being promoted."""
+
+    if report.get("format") != "xiangqi-nnue-training-report-v1":
+        return {"passed": False, "reason": "unsupported or missing training report"}
+    report_config = report.get("config")
+    report_split = report_config.get("split") if isinstance(report_config, dict) else None
+    checkpoint_split = checkpoint.get("split_metadata")
+    split_matches = (
+        isinstance(report_split, dict)
+        and isinstance(checkpoint_split, dict)
+        and report_split == checkpoint_split
+    )
+    split_counts = report_split.get("counts", {}) if isinstance(report_split, dict) else {}
+    if not isinstance(split_counts, dict):
+        split_counts = {}
+    validation_count = split_counts.get("validation", 0)
+    test_count = split_counts.get("test", 0)
+    fixed_test = report.get("fixed_test")
+    if not isinstance(fixed_test, dict):
+        fixed_test = {}
+    validation_metrics = checkpoint.get("validation_metrics")
+    if not isinstance(validation_metrics, dict):
+        validation_metrics = {}
+    checkpoint_validation_loss = validation_metrics.get("total_loss", float("nan"))
+    try:
+        checkpoint_validation_loss = float(checkpoint_validation_loss)
+    except (TypeError, ValueError):
+        checkpoint_validation_loss = float("nan")
+    if not math.isfinite(checkpoint_validation_loss):
+        try:
+            checkpoint_validation_loss = float(
+                checkpoint.get("best_validation_loss", float("nan"))
+            )
+        except (TypeError, ValueError):
+            checkpoint_validation_loss = float("nan")
+    try:
+        checkpoint_best_loss = float(checkpoint.get("best_validation_loss", float("nan")))
+        report_best_epoch = report.get("best_epoch")
+        checkpoint_best_epoch = checkpoint.get("best_epoch")
+        checkpoint_epoch_value = checkpoint.get("epoch")
+    except (TypeError, ValueError):
+        checkpoint_best_loss = float("nan")
+        report_best_epoch = checkpoint_best_epoch = checkpoint_epoch_value = None
+    try:
+        report_validation_loss = float(report.get("best_validation_loss", float("nan")))
+        fixed_test_loss = float(fixed_test.get("score_loss", float("nan")))
+        fixed_count = int(fixed_test.get("sample_count", 0))
+        validation_count = int(validation_count)
+        test_count = int(test_count)
+    except (TypeError, ValueError):
+        return {"passed": False, "reason": "training report contains invalid counts or metrics"}
+
+    valid_epochs = all(
+        isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0
+        for epoch in (report_best_epoch, checkpoint_best_epoch, checkpoint_epoch_value)
+    )
+    epochs_match = (
+        valid_epochs
+        and report_best_epoch == checkpoint_best_epoch == checkpoint_epoch_value
+    )
+    losses_match = (
+        math.isfinite(report_validation_loss)
+        and math.isfinite(checkpoint_best_loss)
+        and math.isfinite(checkpoint_validation_loss)
+        and math.isclose(
+            report_validation_loss, checkpoint_best_loss, rel_tol=1.0e-6, abs_tol=1.0e-8
+        )
+        and math.isclose(
+            report_validation_loss, checkpoint_validation_loss,
+            rel_tol=1.0e-6, abs_tol=1.0e-8,
+        )
+    )
+
+    fixed_test_evaluations = report.get("fixed_test_evaluations", 0)
+    passed = (
+        split_matches
+        and epochs_match
+        and losses_match
+        and validation_count > 0
+        and test_count > 0
+        and fixed_test_evaluations == 1
+        and fixed_count > 0
+        and fixed_count == test_count
+        and math.isfinite(checkpoint_validation_loss)
+        and math.isfinite(report_validation_loss)
+        and math.isfinite(fixed_test_loss)
+    )
+    return {
+        "passed": passed,
+        "validation_samples": validation_count,
+        "fixed_test_manifest_samples": test_count,
+        "fixed_test_evaluated_samples": fixed_count,
+        "fixed_test_evaluations": fixed_test_evaluations,
+        "split_matches_checkpoint": split_matches,
+        "best_epoch_matches_checkpoint": bool(epochs_match),
+        "best_validation_loss_matches_checkpoint": losses_match,
+        "report_best_epoch": report_best_epoch,
+        "checkpoint_best_epoch": checkpoint_best_epoch,
+        "checkpoint_epoch": checkpoint_epoch_value,
+        "checkpoint_best_validation_loss": (
+            checkpoint_best_loss if math.isfinite(checkpoint_best_loss) else None
+        ),
+        "checkpoint_validation_loss": (
+            checkpoint_validation_loss
+            if math.isfinite(checkpoint_validation_loss) else None
+        ),
+        "report_best_validation_loss": (
+            report_validation_loss if math.isfinite(report_validation_loss) else None
+        ),
+        "fixed_test_score_loss": fixed_test_loss if math.isfinite(fixed_test_loss) else None,
+        "reason": None if passed else "validation or fixed-test evidence is incomplete",
+    }
+
+
+def promote_candidate(
+    state_path: Path,
+    generation: int,
+    checkpoint: Path,
+    model: Path,
+    validation_evidence: dict[str, Any],
+    parity_passed: bool,
+    arena_report: dict[str, Any],
+) -> IterationState | None:
+    """只有验证、C++ parity、所有 arena 对手全过才更改冠军引用。"""
+
+    if (
+        validation_evidence.get("passed") is not True
+        or parity_passed is not True
+        or arena_report.get("passed") is not True
+    ):
+        return None
+    if not checkpoint.is_file() or not model.is_file():
+        raise FileNotFoundError("cannot promote missing candidate checkpoint or model")
+    promoted = IterationState(
+        completed_generation=generation,
+        champion_checkpoint=str(checkpoint.resolve()),
+        champion_model=str(model.resolve()),
+        champion_epoch=checkpoint_epoch(checkpoint),
+    )
+    atomic_write_json(state_path, {"format": STATE_FORMAT, **asdict(promoted)})
+    # State points to immutable generation artifacts; stable aliases are conveniences.
+    atomic_copy(checkpoint, state_path.parent / "champion.pt")
+    atomic_copy(model, state_path.parent / "champion.nnue")
+    return promoted
 
 
 def replay_datasets(work_dir: Path, generation: int, count: int) -> list[Path]:
@@ -172,7 +354,7 @@ def generate_data(
         args: 总控脚本命令行配置。
         generation: 当前代数，用于派生可复现随机种子。
         destination: 该代最终 ``data.jsonl`` 路径。
-        teacher_model: 上一代 NNUE；为空时使用手工评估教师。
+        teacher_model: 上一代 NNUE；仅在 ``--label-teacher champion`` 时使用。
     """
 
     if destination.is_file() and destination.stat().st_size > 0:
@@ -214,8 +396,9 @@ def generate_data(
         "--seed",
         str(args.seed + generation),
     ]
-    if teacher_model is not None:
-        command.extend(["--nnue", str(teacher_model)])
+    selected_teacher = teacher_model if args.label_teacher == "champion" else None
+    if selected_teacher is not None:
+        command.extend(["--nnue", str(selected_teacher)])
     run_command(command)
     if not temporary.is_file() or temporary.stat().st_size == 0:
         raise RuntimeError("data generator did not produce a non-empty dataset")
@@ -270,10 +453,20 @@ def train_candidate(
             str(args.batch_size),
             "--learning-rate",
             str(args.learning_rate),
+            "--score-scale",
+            str(args.score_scale),
+            "--outcome-weight",
+            str(args.outcome_weight),
             "--weight-decay",
             str(args.weight_decay),
             "--validation-fraction",
             str(args.validation_fraction),
+            "--test-manifest",
+            str(args.test_manifest),
+            "--quarantine-manifest",
+            str(args.quarantine_manifest),
+            "--split-seed",
+            str(args.split_seed),
             "--workers",
             str(args.workers),
             "--device",
@@ -293,9 +486,19 @@ def train_candidate(
         )
 
     if not best.is_file():
-        if latest.is_file():
-            return latest
-        raise RuntimeError("training produced neither best.pt nor latest.pt")
+        raise RuntimeError("training did not produce best.pt; latest.pt cannot substitute for promotion")
+    report_path = output_dir / "report.json"
+    if not report_path.is_file():
+        raise RuntimeError("training did not produce report.json with fixed-test evidence")
+    with report_path.open("r", encoding="utf-8") as stream:
+        report = json.load(stream)
+    checkpoint = load_checkpoint(best, "cpu")
+    evidence = candidate_validation_evidence(report, checkpoint)
+    if not evidence["passed"]:
+        raise RuntimeError(
+            "candidate lacks valid validation/fixed-test evidence: "
+            f"{evidence['reason']} ({evidence})"
+        )
     return best
 
 
@@ -326,13 +529,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs-per-generation", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
+    parser.add_argument("--score-scale", type=float, default=600.0)
+    parser.add_argument("--outcome-weight", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument("--test-manifest", type=Path, default=DEFAULT_TEST_MANIFEST)
+    parser.add_argument(
+        "--quarantine-manifest", type=Path, default=DEFAULT_QUARANTINE_MANIFEST,
+    )
+    parser.add_argument("--split-seed", type=int, default=2026)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--generator", type=Path, default=Path("build/make/xiangqi_generate_data"))
     parser.add_argument("--engine", type=Path, default=Path("build/make/xiangqi_cli"))
+    parser.add_argument("--protocol-engine", type=Path, default=Path("build/make/xiangqi_protocol"))
+    parser.add_argument("--arena-mode", choices=("depth", "time"), default="time")
+    parser.add_argument(
+        "--arena-depth", type=int, default=None,
+        help="search depth/cap (default: 64 in time mode, 4 in depth mode)",
+    )
+    parser.add_argument("--arena-time-limit-ms", type=int, default=1_000)
+    parser.add_argument("--arena-timeout", type=float, default=10.0)
+    parser.add_argument("--arena-max-plies", type=int, default=300)
+    parser.add_argument("--arena-required-score", type=float, default=0.70)
+    parser.add_argument("--arena-max-unfinished", type=int, default=0)
+    parser.add_argument("--arena-min-games", type=int, default=100)
+    parser.add_argument("--arena-min-independent-pairs", type=int, default=50)
+    parser.add_argument("--arena-openings", type=Path)
+    parser.add_argument("--arena-history", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--label-teacher", choices=("hand", "champion"), default="hand",
+        help="evaluator for generated labels; hand prevents weak NNUE self-scoring",
+    )
     parser.add_argument("--bootstrap-checkpoint", type=Path)
     parser.add_argument("--bootstrap-model", type=Path)
     parser.add_argument("--skip-build", action="store_true")
@@ -367,16 +596,47 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("random margin cannot be negative")
     if not 0.0 <= args.validation_fraction < 1.0:
         raise ValueError("validation fraction must be in [0, 1)")
+    if args.score_scale <= 0.0 or args.outcome_weight < 0.0:
+        raise ValueError("score scale must be positive and outcome weight nonnegative")
+    if (
+        (args.arena_depth is not None and args.arena_depth <= 0)
+        or args.arena_time_limit_ms <= 0
+        or args.arena_timeout <= 0 or args.arena_max_plies <= 0
+        or args.arena_min_games <= 0 or args.arena_min_games % 2
+        or args.arena_min_independent_pairs <= 0
+    ):
+        raise ValueError("arena depth, plies and minimum games must be positive")
+    if not 0.0 <= args.arena_required_score <= 1.0 or args.arena_max_unfinished < 0:
+        raise ValueError("invalid arena promotion threshold")
 
 
 def main() -> None:
-    """连续完成指定数量的代次，并在每代成功后原子更新冠军。"""
+    """连续训练指定数量的候选；未通过对弈门禁则保留冠军并停止。"""
 
     args = parse_args()
     validate_args(args)
+    args.arena_depth = resolve_search_depth(args.arena_mode, args.arena_depth)
     args.work_dir = args.work_dir.resolve()
     args.generator = (PROJECT_ROOT / args.generator).resolve() if not args.generator.is_absolute() else args.generator
     args.engine = (PROJECT_ROOT / args.engine).resolve() if not args.engine.is_absolute() else args.engine
+    args.protocol_engine = (
+        (PROJECT_ROOT / args.protocol_engine).resolve()
+        if not args.protocol_engine.is_absolute() else args.protocol_engine
+    )
+    args.test_manifest = args.test_manifest.resolve()
+    args.quarantine_manifest = args.quarantine_manifest.resolve()
+    args.arena_openings = (
+        args.arena_openings.resolve() if args.arena_openings else DEFAULT_OPENINGS
+    )
+    args.arena_history = [path.resolve() for path in args.arena_history]
+    if not args.test_manifest.is_file():
+        raise FileNotFoundError(f"fixed test manifest missing: {args.test_manifest}")
+    if not args.quarantine_manifest.is_file():
+        raise FileNotFoundError(f"score quarantine manifest missing: {args.quarantine_manifest}")
+    if not args.arena_openings.is_file():
+        raise FileNotFoundError(f"arena opening file missing: {args.arena_openings}")
+    if any(not path.is_file() for path in args.arena_history):
+        raise FileNotFoundError("one or more fixed historical arena models are missing")
     state_path = args.work_dir / "state.json"
     state = load_state(state_path)
 
@@ -387,7 +647,7 @@ def main() -> None:
 
     if not args.skip_build:
         run_command(["make", "-j2", "all"])
-    if not args.generator.is_file() or not args.engine.is_file():
+    if not all(path.is_file() for path in (args.generator, args.engine, args.protocol_engine)):
         raise FileNotFoundError("generator or C++ engine is missing; build the project first")
 
     champion_checkpoint = resolve_saved_path(state.champion_checkpoint)
@@ -412,12 +672,6 @@ def main() -> None:
                     str(champion_model),
                 ]
             )
-
-    print(
-        "warning: automatic promotion verifies file integrity and Python/C++ parity, "
-        "but does not yet prove that the candidate is stronger by arena matches",
-        flush=True,
-    )
 
     first_generation = state.completed_generation + 1
     final_generation = first_generation + args.generations
@@ -451,7 +705,7 @@ def main() -> None:
                 str(candidate_model),
             ]
         )
-        run_command(
+        parity_passed = run_command(
             [
                 sys.executable,
                 "-m",
@@ -461,25 +715,61 @@ def main() -> None:
                 str(args.engine),
             ]
         )
+        with (generation_dir / "checkpoints" / "report.json").open(
+            "r", encoding="utf-8"
+        ) as stream:
+            training_report = json.load(stream)
+        validation_evidence = candidate_validation_evidence(
+            training_report, load_checkpoint(candidate_checkpoint, "cpu")
+        )
+        if not validation_evidence["passed"]:
+            raise RuntimeError("candidate validation/fixed-test evidence changed before promotion")
 
-        # 状态始终指向不会被后续代覆盖的文件，避免更新稳定别名时断电造成
-        # “新检查点 + 旧模型”的混合教师。champion.* 只是方便外部程序使用的别名。
-        champion_checkpoint = candidate_checkpoint.resolve()
-        champion_model = candidate_model.resolve()
-        state = IterationState(
-            completed_generation=generation,
-            champion_checkpoint=str(champion_checkpoint),
-            champion_model=str(champion_model),
-            champion_epoch=checkpoint_epoch(champion_checkpoint),
+        opponents = arena_opponents(champion_model, args.arena_history)
+        arena_report = run_arena(
+            args.protocol_engine,
+            candidate_model,
+            opponents,
+            next_arena_report_path(generation_dir),
+            search_mode=args.arena_mode,
+            depth=args.arena_depth,
+            time_limit_ms=args.arena_time_limit_ms,
+            max_plies=args.arena_max_plies,
+            required_score=args.arena_required_score,
+            max_unfinished=args.arena_max_unfinished,
+            min_games=args.arena_min_games,
+            min_independent_pairs=args.arena_min_independent_pairs,
+            openings_path=args.arena_openings,
+            timeout_seconds=args.arena_timeout,
         )
-        atomic_write_json(
+        if not arena_report["passed"]:
+            print(
+                f"candidate generation {generation:03d} failed arena gate; "
+                "champion is unchanged and candidate artifacts are retained",
+                flush=True,
+            )
+            break
+
+        promoted = promote_candidate(
             state_path,
-            {"format": STATE_FORMAT, **asdict(state)},
+            generation,
+            candidate_checkpoint,
+            candidate_model,
+            validation_evidence,
+            parity_passed=parity_passed,
+            arena_report=arena_report,
         )
-        stable_checkpoint = args.work_dir / "champion.pt"
+        if promoted is None:
+            print(
+                f"candidate generation {generation:03d} failed a promotion gate; "
+                "champion is unchanged and candidate artifacts are retained",
+                flush=True,
+            )
+            break
+        state = promoted
+        champion_checkpoint = Path(state.champion_checkpoint)
+        champion_model = Path(state.champion_model)
         stable_model = args.work_dir / "champion.nnue"
-        atomic_copy(champion_checkpoint, stable_checkpoint)
-        atomic_copy(champion_model, stable_model)
         print(
             f"promoted generation {generation:03d}: {stable_model}",
             flush=True,

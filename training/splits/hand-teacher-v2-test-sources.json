@@ -1,0 +1,19 @@
+{
+  "format": "xiangqi-fixed-test-sources-v1",
+  "manifest_sha256": "6835c0163dd6e692e6a9b7eecfa30b5d8531dd6bd890c43c6d06b5e786737f41",
+  "source_fingerprints": {
+    "training/runs/hand-teacher-v2/batch-002.jsonl": "511c8ecfaa36d826a0b5110cb40692b47722b30f42b26e3516f6b7434f8ee481",
+    "training/runs/hand-teacher-v2/batch-003.jsonl": "9d4428893efc39be887f29d7cc4af9bad2d3255761d78e801f8776c8eaa3a641",
+    "training/runs/hand-teacher-v2/batch-004.jsonl": "3b74ab962fbb930b9d9b5a01b7341058f11bfc9a5410deeb28886968649d7f75",
+    "training/runs/hand-teacher-v2/batch-005.jsonl": "7d950fd9df04ca60be06f8579be34b2daafc7f2b369997482f06bdb13271ebab",
+    "training/runs/hand-teacher-v2/batch-006.jsonl": "59443b8bca1b2b19dcfc64a1284fce2ae56abe6a9cb5f1d7646d659ad64780c3",
+    "training/runs/hand-teacher-v2/batch-007.jsonl": "545e50d4f3867fc95af687e1ec36b194e70f6f8ab91a538b9ccea9fec6144fd3",
+    "training/runs/hand-teacher-v2/batch-008.jsonl": "59b80418cec039e31bed78780ae39f2f2186d0ef0ffe5349ae08e123765f1dd2",
+    "training/runs/hand-teacher-v2/batch-009.jsonl": "d9a3bddd742e3eb0f3e3e242a9ed11b7a9aa253246775a50114f48cce0168570",
+    "training/runs/hand-teacher-v2/batch-010.jsonl": "72e0e27588c1d318135fc3b0311d7a64f025eea23fc4a4053e65847294b1fb91",
+    "training/runs/hand-teacher-v2/batch-011.jsonl": "d1ffb197ac8d3eded10cc72b80bcd1cf519f25b55c5f3b6d7cd1fdc6b1b48b8c",
+    "training/runs/hand-teacher-v2/batch-012.jsonl": "7dddcb336fb4be588f46fdcb805c8893a545267aa8037b3ca06a751c14746e95",
+    "training/runs/hand-teacher-v2/batch-013.jsonl": "4b0a3d28bbe37da3c65427907e0f07c1e7a48edf5128695fc2b98521b747b61e",
+    "training/runs/hand-teacher-v2/pilot-001.jsonl": "7b44d99693feb7d8c13b72f2c4efa2d0b8ae3b7d8ce58f95fa1921c66a76af54"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "format": "xiangqi-score-quarantine-v1",
+  "max_absolute_score": 2,
+  "sources": [
+    "training/runs/iterations-20261009/generation-000/data.jsonl",
+    "training/runs/iterations-20261009/generation-001/data.jsonl",
+    "training/runs/iterations-20261009/generation-002/data.jsonl",
+    "training/runs/iterations-20261009/generation-003/data.jsonl",
+    "training/runs/iterations-20261009/generation-004/data.jsonl",
+    "training/runs/iterations-20261009/generation-005/data.jsonl",
+    "training/runs/iterations-20261009/generation-006/data.jsonl",
+    "training/runs/iterations-20261009/generation-007/data.jsonl",
+    "training/runs/iterations-20261009/generation-008/data.jsonl",
+    "training/runs/iterations-20261009/generation-009/data.jsonl",
+    "training/runs/iterations-20261009/generation-010/data.jsonl",
+    "training/runs/iterations-20261009/generation-011/data.jsonl"
+  ]
+}

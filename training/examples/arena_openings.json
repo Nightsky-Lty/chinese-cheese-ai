@@ -1,0 +1,357 @@
+{
+  "format": "xiangqi-arena-openings-v1",
+  "initial_fen": "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w",
+  "openings": [
+    {
+      "name": "b2e2_b7e7",
+      "moves": [
+        "b2e2",
+        "b7e7"
+      ]
+    },
+    {
+      "name": "b2e2_h7e7",
+      "moves": [
+        "b2e2",
+        "h7e7"
+      ]
+    },
+    {
+      "name": "b2e2_h9g7",
+      "moves": [
+        "b2e2",
+        "h9g7"
+      ]
+    },
+    {
+      "name": "b2e2_b9c7",
+      "moves": [
+        "b2e2",
+        "b9c7"
+      ]
+    },
+    {
+      "name": "b2e2_e6e5",
+      "moves": [
+        "b2e2",
+        "e6e5"
+      ]
+    },
+    {
+      "name": "b2e2_a9a8",
+      "moves": [
+        "b2e2",
+        "a9a8"
+      ]
+    },
+    {
+      "name": "b2e2_i9i8",
+      "moves": [
+        "b2e2",
+        "i9i8"
+      ]
+    },
+    {
+      "name": "b2e2_a6a5",
+      "moves": [
+        "b2e2",
+        "a6a5"
+      ]
+    },
+    {
+      "name": "b2e2_c6c5",
+      "moves": [
+        "b2e2",
+        "c6c5"
+      ]
+    },
+    {
+      "name": "b2e2_g6g5",
+      "moves": [
+        "b2e2",
+        "g6g5"
+      ]
+    },
+    {
+      "name": "h2e2_b7e7",
+      "moves": [
+        "h2e2",
+        "b7e7"
+      ]
+    },
+    {
+      "name": "h2e2_h7e7",
+      "moves": [
+        "h2e2",
+        "h7e7"
+      ]
+    },
+    {
+      "name": "h2e2_h9g7",
+      "moves": [
+        "h2e2",
+        "h9g7"
+      ]
+    },
+    {
+      "name": "h2e2_b9c7",
+      "moves": [
+        "h2e2",
+        "b9c7"
+      ]
+    },
+    {
+      "name": "h2e2_e6e5",
+      "moves": [
+        "h2e2",
+        "e6e5"
+      ]
+    },
+    {
+      "name": "h2e2_a9a8",
+      "moves": [
+        "h2e2",
+        "a9a8"
+      ]
+    },
+    {
+      "name": "h2e2_i9i8",
+      "moves": [
+        "h2e2",
+        "i9i8"
+      ]
+    },
+    {
+      "name": "h2e2_a6a5",
+      "moves": [
+        "h2e2",
+        "a6a5"
+      ]
+    },
+    {
+      "name": "h2e2_c6c5",
+      "moves": [
+        "h2e2",
+        "c6c5"
+      ]
+    },
+    {
+      "name": "h2e2_g6g5",
+      "moves": [
+        "h2e2",
+        "g6g5"
+      ]
+    },
+    {
+      "name": "h0g2_b7e7",
+      "moves": [
+        "h0g2",
+        "b7e7"
+      ]
+    },
+    {
+      "name": "h0g2_h7e7",
+      "moves": [
+        "h0g2",
+        "h7e7"
+      ]
+    },
+    {
+      "name": "h0g2_h9g7",
+      "moves": [
+        "h0g2",
+        "h9g7"
+      ]
+    },
+    {
+      "name": "h0g2_b9c7",
+      "moves": [
+        "h0g2",
+        "b9c7"
+      ]
+    },
+    {
+      "name": "h0g2_e6e5",
+      "moves": [
+        "h0g2",
+        "e6e5"
+      ]
+    },
+    {
+      "name": "h0g2_a9a8",
+      "moves": [
+        "h0g2",
+        "a9a8"
+      ]
+    },
+    {
+      "name": "h0g2_i9i8",
+      "moves": [
+        "h0g2",
+        "i9i8"
+      ]
+    },
+    {
+      "name": "h0g2_a6a5",
+      "moves": [
+        "h0g2",
+        "a6a5"
+      ]
+    },
+    {
+      "name": "h0g2_c6c5",
+      "moves": [
+        "h0g2",
+        "c6c5"
+      ]
+    },
+    {
+      "name": "h0g2_g6g5",
+      "moves": [
+        "h0g2",
+        "g6g5"
+      ]
+    },
+    {
+      "name": "b0c2_b7e7",
+      "moves": [
+        "b0c2",
+        "b7e7"
+      ]
+    },
+    {
+      "name": "b0c2_h7e7",
+      "moves": [
+        "b0c2",
+        "h7e7"
+      ]
+    },
+    {
+      "name": "b0c2_h9g7",
+      "moves": [
+        "b0c2",
+        "h9g7"
+      ]
+    },
+    {
+      "name": "b0c2_b9c7",
+      "moves": [
+        "b0c2",
+        "b9c7"
+      ]
+    },
+    {
+      "name": "b0c2_e6e5",
+      "moves": [
+        "b0c2",
+        "e6e5"
+      ]
+    },
+    {
+      "name": "b0c2_a9a8",
+      "moves": [
+        "b0c2",
+        "a9a8"
+      ]
+    },
+    {
+      "name": "b0c2_i9i8",
+      "moves": [
+        "b0c2",
+        "i9i8"
+      ]
+    },
+    {
+      "name": "b0c2_a6a5",
+      "moves": [
+        "b0c2",
+        "a6a5"
+      ]
+    },
+    {
+      "name": "b0c2_c6c5",
+      "moves": [
+        "b0c2",
+        "c6c5"
+      ]
+    },
+    {
+      "name": "b0c2_g6g5",
+      "moves": [
+        "b0c2",
+        "g6g5"
+      ]
+    },
+    {
+      "name": "e3e4_b7e7",
+      "moves": [
+        "e3e4",
+        "b7e7"
+      ]
+    },
+    {
+      "name": "e3e4_h7e7",
+      "moves": [
+        "e3e4",
+        "h7e7"
+      ]
+    },
+    {
+      "name": "e3e4_h9g7",
+      "moves": [
+        "e3e4",
+        "h9g7"
+      ]
+    },
+    {
+      "name": "e3e4_b9c7",
+      "moves": [
+        "e3e4",
+        "b9c7"
+      ]
+    },
+    {
+      "name": "e3e4_e6e5",
+      "moves": [
+        "e3e4",
+        "e6e5"
+      ]
+    },
+    {
+      "name": "e3e4_a9a8",
+      "moves": [
+        "e3e4",
+        "a9a8"
+      ]
+    },
+    {
+      "name": "e3e4_i9i8",
+      "moves": [
+        "e3e4",
+        "i9i8"
+      ]
+    },
+    {
+      "name": "e3e4_a6a5",
+      "moves": [
+        "e3e4",
+        "a6a5"
+      ]
+    },
+    {
+      "name": "e3e4_c6c5",
+      "moves": [
+        "e3e4",
+        "c6c5"
+      ]
+    },
+    {
+      "name": "e3e4_g6g5",
+      "moves": [
+        "e3e4",
+        "g6g5"
+      ]
+    }
+  ]
+}
+

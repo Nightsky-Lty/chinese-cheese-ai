@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Sequence
 
 import torch
@@ -15,6 +16,7 @@ CONCATENATED_SIZE = ACCUMULATOR_SIZE * 2
 HIDDEN_SIZE = 32
 EVALUATION_LIMIT = 28_000
 ARCHITECTURE_NAME = "halfka-11340-256x2-32-1-f32"
+DEFAULT_SCORE_SCALE = 600.0
 
 
 @dataclass
@@ -33,6 +35,8 @@ class NnueBatch:
         red_to_move: 每个样本是否由红方行棋的布尔张量。
         targets: 当前行棋方视角的目标引擎分值。
         weights: 每条样本的正数损失权重。
+        results: 当前行棋方视角的赛果，胜/和/负分别为 1/0/-1。
+        result_known: 对应赛果是否真实存在；未知赛果绝不当作和棋。
     """
 
     red_indices: Tensor
@@ -42,6 +46,9 @@ class NnueBatch:
     red_to_move: Tensor
     targets: Tensor
     weights: Tensor
+    results: Tensor
+    result_known: Tensor
+    phases: list[str] | None = None
 
     def to(self, device: torch.device | str) -> "NnueBatch":
         """把批次中的全部张量移动到指定设备。
@@ -61,6 +68,9 @@ class NnueBatch:
             red_to_move=self.red_to_move.to(device),
             targets=self.targets.to(device),
             weights=self.weights.to(device),
+            results=self.results.to(device),
+            result_known=self.result_known.to(device),
+            phases=self.phases,
         )
 
 
@@ -92,8 +102,12 @@ class HalfKANetwork(nn.Module):
     ``512→32`` 和输出层 ``32→1``。两处隐藏输出都使用 ``clamp(0, 1)``。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, score_scale: float = 1.0) -> None:
         super().__init__()
+        if not math.isfinite(score_scale) or score_scale <= 0.0:
+            raise ValueError("score scale must be finite and positive")
+        # 不属于 state_dict；检查点的 scoring 元数据决定末层输出单位。
+        self.score_scale = float(score_scale)
         self.feature_weights = nn.Parameter(
             torch.empty(FEATURE_DIMENSIONS, ACCUMULATOR_SIZE)
         )
@@ -181,6 +195,24 @@ class HalfKANetwork(nn.Module):
         black_offsets: Tensor,
         red_to_move: Tensor,
     ) -> Tensor:
+        """从当前行棋方视角评估一个稀疏批次。"""
+
+        return self.forward_with_activations(
+            red_indices,
+            red_offsets,
+            black_indices,
+            black_offsets,
+            red_to_move,
+        )[0]
+
+    def forward_with_activations(
+        self,
+        red_indices: Tensor,
+        red_offsets: Tensor,
+        black_indices: Tensor,
+        black_offsets: Tensor,
+        red_to_move: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """从当前行棋方视角评估一个稀疏批次。
 
         参数:
@@ -191,7 +223,9 @@ class HalfKANetwork(nn.Module):
             red_to_move: 每个样本是否红方行棋，形状为 ``[batch]``。
 
         返回:
-            形状为 ``[batch]`` 的未取整 float32 引擎分值。
+            ``(raw_output, accumulator_pre_activation, hidden_pre_activation)``。
+            输出形状为 ``[batch]``；乘以 score_scale 得引擎分值。后两项用于
+            测量 clipped-ReLU 的上下饱和比例，不改变网络计算。
 
         异常:
             ValueError: 行棋方张量形状与批大小不匹配。
@@ -200,17 +234,22 @@ class HalfKANetwork(nn.Module):
         red, black = self.accumulators(
             red_indices, red_offsets, black_indices, black_offsets
         )
-        red = torch.clamp(red, 0.0, 1.0)
-        black = torch.clamp(black, 0.0, 1.0)
-
         if red_to_move.ndim != 1 or red_to_move.numel() != red.shape[0]:
             raise ValueError("red_to_move must contain one value per sample")
+        accumulator_pre_activation = torch.cat((red, black), dim=0)
+        red = torch.clamp(red, 0.0, 1.0)
+        black = torch.clamp(black, 0.0, 1.0)
         # C++ 约定把当前方累加器放前 256 维，对方累加器放后 256 维。
         red_first = torch.cat((red, black), dim=1)
         black_first = torch.cat((black, red), dim=1)
         combined = torch.where(red_to_move[:, None], red_first, black_first)
-        hidden = torch.clamp(self.hidden(combined), 0.0, 1.0)
-        return self.output(hidden).squeeze(1)
+        hidden_pre_activation = self.hidden(combined)
+        hidden = torch.clamp(hidden_pre_activation, 0.0, 1.0)
+        return (
+            self.output(hidden).squeeze(1),
+            accumulator_pre_activation,
+            hidden_pre_activation,
+        )
 
     def forward_batch(self, batch: NnueBatch) -> Tensor:
         """使用 ``NnueBatch`` 调用前向传播。
@@ -229,3 +268,8 @@ class HalfKANetwork(nn.Module):
             batch.black_offsets,
             batch.red_to_move,
         )
+
+    def score_batch(self, batch: NnueBatch) -> Tensor:
+        """返回当前行棋方视角、以引擎分数为单位的批量评分。"""
+
+        return self.forward_batch(batch) * self.score_scale
