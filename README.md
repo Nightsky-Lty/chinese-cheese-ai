@@ -864,6 +864,8 @@ Python/C++ 原始评分最大误差约 `0.000183`，真实导出网络 130 次�
 本机证据保存在 `training/runs/first-round-score-baseline-20261010/`，包括
 `best.pt`、`best.nnue`、`metrics.jsonl`、`report.json`、`parity.json`、
 `arena-depth2.json`、`arena-time20ms.json` 和汇总 `acceptance.json`；它们不随 Git 推送。
+`arena-openings-used.json` 保存评测时开局文件的原始字节（包括格式），与报告中的哈希一致；
+需要复核原输入时传入 `--openings` 指向此快照。
 
 ## 命令行使用
 
