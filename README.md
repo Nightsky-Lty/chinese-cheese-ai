@@ -509,7 +509,7 @@ Huber 阈值也除以同一尺度；`score`、MAE 和诊断分位数仍用引擎
 `queue.log` 汇总输出，`wide64.log` / `deep32x2.log` 分别记录两组对战。
 每组结束后写入对应模型目录的 `arena-500ms.json`（完整走法、协议记录和统计）；
 全部结束后生成 `comparison.json`，并列保存 50ms / 500ms 结果。
-若进程失败，状态会记录错误；这些运行文件不随 Git 推送。后台队列已经启动时，
+若进程失败，状态会记录错误；这些运行文件不随 Git 推送。后台队列运行时，
 不要再运行上面的单组命令；竞技场也会拒绝覆盖已有报告。
 
 ```bash
@@ -517,6 +517,11 @@ Huber 阈值也除以同一尺度；`score`、MAE 和诊断分位数仍用引擎
 .venv/bin/python -m json.tool training/runs/architecture-1m-500ms-v1/queue-state.json
 tail -f training/runs/architecture-1m-500ms-v1/queue.log
 ```
+
+本轮 500ms 队列已按用户要求停止：加宽组记录了 88 局，23 胜 / 1 和 / 59 负 /
+5 未完成；加深组尚未开始。停止后的状态为 `stopped`，不会自动启动下一组；
+防自动睡眠断言也已释放。日志和局数统计保留，但由于中途停止，没有生成完整
+`arena-500ms.json` 或两组汇总，不能当作完成的评测或冠军晋升证据。
 
 训练/验证按“源批次＋对局 ID”分组；没有可靠对局 ID 时整文件分组。
 固定测试清单绑定源文件 SHA-256，源文件缺失或改变会拒绝训练；相同局面及水平镜像
