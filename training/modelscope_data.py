@@ -249,6 +249,38 @@ def prepare(args: argparse.Namespace) -> None:
     for _, _, path, _ in all_paths:
         if not path.is_file():
             raise FileNotFoundError(path)
+    completed_path = output / "sampling-report.json"
+    if completed_path.exists():
+        completed = json.loads(completed_path.read_text())
+        if completed.get("status") == "complete":
+            # Completed datasets are frozen artifacts. Removed historical test anchors
+            # are not needed to resume sampling because there is nothing left to sample.
+            expected = {"train_count": args.train_count, "validation_count": args.validation_count,
+                        "seed": args.seed, "per_game": args.per_game, "max_score": args.max_score,
+                        "convention": args.convention, "score_multiplier": args.score_multiplier,
+                        "test_count": args.test_count}
+            old_plan = completed["plan"]
+            if any(old_plan.get(key, 0 if key == "test_count" else None) != value
+                   for key, value in expected.items()):
+                raise ValueError("completed sampling configuration changed; use a new output directory")
+            fixed = old_plan.get("fixed_validation")
+            if bool(fixed) != bool(args.fixed_validation) or (fixed and
+                    file_fingerprint(args.fixed_validation) != fixed["sha256"]):
+                raise ValueError("completed fixed validation changed")
+            if file_fingerprint(args.audit) != old_plan["audit_sha256"]:
+                raise ValueError("completed sampling audit changed")
+            for filename, field in (("train.jsonl", "train_sha256"),
+                                    ("validation.jsonl", "validation_sha256")):
+                if file_fingerprint(output / filename) != completed[field]:
+                    raise ValueError(f"completed sample file changed: {filename}")
+            if args.test_count:
+                if file_fingerprint(output / "test.jsonl") != completed["test_sha256"]:
+                    raise ValueError("completed test samples changed")
+                if file_fingerprint(output / "test-manifest.json") != completed["test_manifest_sha256"]:
+                    raise ValueError("completed test manifest changed")
+                load_test_manifest(output / "test-manifest.json")
+            print(f"already complete: train={completed['train_count']} validation={completed['validation_count']}", flush=True)
+            return
     audit_report = json.loads(args.audit.read_text())
     result = audit_report["comparison"][args.convention]
     if result["decisive_count"] < 20 or result["sign_agreement"] is None or result["sign_agreement"] < 0.9:
@@ -491,7 +523,7 @@ def parse_args() -> argparse.Namespace:
             command.add_argument("--test-count", type=int, default=0,
                                  help="additional final-test positions from original val databases")
             command.add_argument("--per-game", type=int, default=8)
-            command.add_argument("--test-manifest", type=Path, default=ROOT / "training/runs/pikafish-full-20261011/teacher-test-manifest.json")
+            command.add_argument("--test-manifest", type=Path, default=ROOT / "training/data/modelscope-nowcan/processed/competition-1m-v1/test-manifest.json")
     args = parser.parse_args()
     if args.command != "inventory" and (args.max_score <= 0 or not math.isfinite(args.max_score)):
         parser.error("max-score must be finite and positive")

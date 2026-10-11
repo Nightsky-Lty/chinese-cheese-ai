@@ -12,8 +12,8 @@ from typing import Any, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_FORMAT = "xiangqi-fixed-test-v1"
-DEFAULT_TEST_MANIFEST = PROJECT_ROOT / "training/splits/hand-teacher-v2-test.json"
-DEFAULT_QUARANTINE_MANIFEST = PROJECT_ROOT / "training/splits/legacy-narrow-scores.json"
+DEFAULT_TEST_MANIFEST = PROJECT_ROOT / "training/data/modelscope-nowcan/processed/competition-1m-v1/test-manifest.json"
+DEFAULT_QUARANTINE_MANIFEST = PROJECT_ROOT / "training/splits/score-quarantine.json"
 QUARANTINE_FORMAT = "xiangqi-score-quarantine-v1"
 TEST_SOURCE_SIDECAR_FORMAT = "xiangqi-fixed-test-sources-v1"
 

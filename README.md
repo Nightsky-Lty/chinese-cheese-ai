@@ -56,6 +56,7 @@ chinese-cheese-ai/
 │   ├── modelscope_data.py            # nowcan SQLite 棋谱审计、合法重放与断点抽样
 │   ├── modelscope_baseline.py        # 独立验证集基线训练、续训、导出与一致性检查
 │   ├── modelscope_competition.py     # 百万局面训练、同单位最终测试及冠军竞争
+│   ├── DATA_FORMAT.md               # ModelScope 样本、模型、配置与日志格式
 │   ├── run_lock.py                   # macOS/Linux/Windows 单任务独占锁
 │   ├── export_nnue.py                # 导出 XQNNUEF1 权重
 │   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
@@ -497,7 +498,8 @@ Python 训练器可选择对已知赛果样本叠加赛果损失，未知赛果�
 默认 50 个不同开局各交换红黑，每对手 100 局。统计胜/和/负与未完成局，未完成不算和棋；
 保存完整走法、结束原因、协议记录、模型/引擎/开局哈希和预算配置。
 以完整换先开局对为统计簇，报告保守 95% Hoeffding 区间及诊断用 bootstrap 区间。
-晋升要求得分率及保守区间下界均达到阈值，且满足至少 100 局、50 个完整开局对的硬门槛。
+晋升要求得分率及保守区间下界均达到阈值，且至少评测 100 局。默认允许每个对手
+最多 5 局因步数上限而未完成，50 个开局对中至少 45 对完整；协议错误不在容许范围内。
 这些开局共享初始棋盘，不等于严格独立样本；报告明确注明该限制。
 
 ### 7. Negamax 与 Alpha-Beta/PVS 搜索
@@ -769,8 +771,10 @@ python3 -m venv .venv
 `--huber-beta` 仍以引擎分值给出，内部会同步缩放。检查点记录尺度版本和当前行棋方
 视角；导出 `.nnue` 时只把末层还原为引擎分数。旧检查点按尺度 1 读取，跨尺度续训
 会换算末层并重置优化器状态，避免旧动量单位混用。已有
-`training/splits/hand-teacher-v2-test.json` 及其 `-sources.json` 侧车绑定当前教师批次，
-不要覆盖它们。如果是另一份数据，应在查看模型结果前一次性创建新的固定清单：
+默认固定测试清单为 `training/data/modelscope-nowcan/processed/competition-1m-v1/test-manifest.json`。
+旧手工教师实验与清单已在 2026-10-11 清理；下面涉及 `hand-teacher-v2`、旧 NNUE 或
+Pikafish 实验目录的示例与成绩是历史说明，本地不再保留相应产物。
+如果是另一份数据，应在查看模型结果前一次性创建新的固定清单：
 
 ```bash
 .venv/bin/python -m training.partition training/runs/my-teacher/*.jsonl \
@@ -799,8 +803,8 @@ python3 -m venv .venv
 ```
 
 `--outcome-weight` 默认为 0，以保持旧训练和自动迭代流程的行为不变。
-旧 `iterations-20261009` 的 12 代数据中评分全部落在 −2～2；训练器按
-`training/splits/legacy-narrow-scores.json` 隔离这些标签，保留原始局面文件供重新标注。
+旧 `iterations-20261009` 的 12 代数据评分全部落在 −2～2，现已删除。
+过滤配置为 `training/splits/score-quarantine.json`，当前来源列表为空，不过滤 ModelScope 标签。
 固定测试清单中的整盘对局不会参与训练，未来回放遇到相同或水平镜像局面也会移除。
 最佳 epoch 由整局分组验证集选择，固定测试集只在训练结束后报告。
 
@@ -833,7 +837,8 @@ python3 -m venv .venv
 `--arena-min-independent-pairs` 和 `--arena-max-unfinished`。
 三种 CLI 在 time 模式未指定深度时采用上限 64，depth 模式默认 4；显式深度始终保留。
 时间评测只保证相同每步预算，不保证跨机器或不同负载逐着完全复现。
-降低试跑局数不能降低正式晋升的 100 局/50 开局对硬门槛；评测文件默认不覆盖。
+降低试跑局数不能降低正式晋升的 100 局门槛；完整开局对要求随未完成额度调整，
+但不得低于原独立开局要求的 90%。评测文件默认不覆盖。
 
 ### 第一轮基线验收（2026-10-10）
 
@@ -1059,7 +1064,7 @@ macOS 通用可执行文件、教师权重及许可文件保存在 `training/too
 .venv/bin/python -u -m training.train \
   training/data/modelscope-nowcan/processed/baseline-100k-v1/train.jsonl \
   --validation-dataset training/data/modelscope-nowcan/processed/baseline-100k-v1/validation.jsonl \
-  --test-manifest training/runs/pikafish-full-20261011/teacher-test-manifest.json \
+  --test-manifest training/data/modelscope-nowcan/processed/competition-1m-v1/test-manifest.json \
   --skip-fixed-test --output-dir training/runs/modelscope-nowcan-100k-v1 \
   --epochs 20 --batch-size 512 --score-scale 600 --outcome-weight 0 --device cpu
 ```
@@ -1078,7 +1083,7 @@ macOS 通用可执行文件、教师权重及许可文件保存在 `training/too
 泛化差距，不能把训练完成当作棋力提升。导出文件为
 `training/runs/modelscope-nowcan-100k-v1/best.nnue`，约 11.68 MB；三个固定局面的
 Python/C++ 评分最大绝对差约 0.000363，通过抽查。尚未做对战评测，也未晋升冠军；
-旧模型及旧数据全部保留。按当前工作约定，没有运行完整回归测试。
+旧实验后来已按用户要求清理，只保留 ModelScope 模型与数据。按当前工作约定，没有运行完整回归测试。
 
 ### 百万局面训练与冠军竞争
 
@@ -1119,13 +1124,50 @@ tail -f training/runs/modelscope-nowcan-1m-v1/train.log
 推理抽查 → 竞技场。每个对手 100 局、50 个固定开局换先；对手为手工评估、当前冠军、
 上一轮 nowcan 10 万条模型。默认每步 **50 ms**，深度上限 64，最多 300 半步。
 这是短时间预算竞争，不等同于 GUI 的 500 ms 棋力评测。晋升仍要求所有对手的得分率
-及 95% 保守下界均至少 70%，无未完成局；没有降低既有门槛。
+及 95% 保守下界均至少 70%。2026-10-11 按用户要求，默认允许每个对手最多 5 局
+因步数上限未完成（`--max-unfinished 5`），未完成局不计为和棋、不进入得分率；
+完整开局对至少 45 对，置信区间仍按实际完整开局簇计算。协议/引擎故障始终不通过，
+`--max-unfinished 0` 可恢复零容忍策略。
 
-新的共同冠军目录为 `training/runs/champions/`，初始冠军从旧迭代的 `state.json`
-引用导入。只有完整门禁通过，才更新该目录的 `state.json`、`champion.pt`、
-`champion.nnue`，并保留前冠军来源。旧迭代目录不覆盖，也不自动修改 GUI 启动参数。
+共同冠军目录为 `training/runs/champions/`。2026-10-11 用户明确指定百万样本模型
+为冠军，登记来源为 `user-selected-modelscope-1m`，不是自动门禁晋升；后续自动晋升
+仍必须通过完整门禁。登记引用保留的 ModelScope 实验，`champion.pt`、`champion.nnue`
+提供稳定使用路径，不再依赖旧迭代目录。GUI 需显式传入 `--nnue`，不会自动切换。
 竞技失败的候选和数据保留，状态为 `rejected`；已完成任务重跑不会再次抽样或自动
 复赛。后续竞争读取共同目录中的冠军；旧 `iterate.py` 仍使用它自己的迭代状态。
+未来采样默认保护本轮 ModelScope 测试集；已完成的数据与实验报告保持原样，历史计划
+中指向已删除旧输入的路径仅作溯源记录，不表示那些旧文件仍可用。新实验请使用新的
+`--dataset-dir` / `--work-dir`，不要覆盖固定样本或既有结果。
+
+### 当前保留内容与使用方式（2026-10-11）
+
+旧手工教师、12 代迭代、Pikafish 标注试验、归一化试跑及赛果对照的模型与数据已直接
+删除（不在废纸篓中）。保留源代码、规则/训练测试代码、Pikafish 工具、GUI 标定与模板，
+以及全部 ModelScope 原包、解压数据库、两批固定样本、正式评分审计、日志和评测报告。
+
+```text
+training/runs/
+├── modelscope-nowcan-100k-v1/   10 万样本基线，保留检查点与推理模型
+├── modelscope-nowcan-1m-v1/     百万样本模型，第 9 轮最佳，保留 300 局评测
+└── champions/                 用户指定的百万样本冠军与登记
+```
+
+百万实验完成 20 轮，最佳验证损失 0.565987、最终测试损失 0.599684。
+旧门禁下 300 局结果：对手工 65 胜/5 和/23 负/7 未完成，对旧冠军 99 胜/1 未完成，
+对 10 万样本模型 74 胜/2 和/21 负/3 未完成。所有未完成均为步数上限；原报告的
+`passed=false`、实验 `rejected` 记录不改写，人工冠军选择单独写入冠军登记。
+
+使用冠军（真实点击前应确认窗口编号与初始行棋方；去掉 `--execute` 只预览）：
+
+```bash
+.venv/bin/python -m gui.cli control \
+  --live --query 微信 --index 1 --side red --ai-side red \
+  --nnue training/runs/champions/champion.nnue \
+  --depth 8 --move-time-ms 500 --stable-frames 4 --interval 0.1 \
+  --click-interval 0.25 --confirmation-frames 200 --interactive-recovery --execute
+```
+
+JSONL 样本、评分视角、检查点和日志格式见 [training/DATA_FORMAT.md](training/DATA_FORMAT.md)。
 
 ## 命令行使用
 

@@ -1,6 +1,6 @@
 """扩充 nowcan 数据、训练原架构候选，并通过完整门禁竞争冠军。
 
-所有阶段有独立日志和状态；未通过门禁不更改冠军，原迭代目录保持不变。
+所有阶段有独立日志和状态；自动晋升须通过门禁，不依赖已清理的历史实验目录。
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def verify_artifact(record: dict[str, str]) -> Path:
 
 
 def incumbent(store: Path) -> dict[str, Any]:
-    """读取共同竞争目录的冠军；首次运行从旧迭代冠军建立引用，不覆盖旧目录。"""
+    """读取共同目录中的冠军；无冠军登记时要求显式建立，不再依赖旧实验。"""
 
     with run_lock(store / "champion.lock"):
         state_path = store / "state.json"
@@ -60,16 +60,7 @@ def incumbent(store: Path) -> dict[str, Any]:
             verify_artifact(record["model"])
             verify_artifact(record["checkpoint"])
             return record
-        old_path = ROOT / "training/runs/iterations-20261009/state.json"
-        old = json.loads(old_path.read_text())
-        record = {"format": "xiangqi-champion-registry-v1", "updated_at": now(),
-                  "origin": "legacy-iteration-import", "source_state": artifact(old_path),
-                  "checkpoint": artifact(Path(old["champion_checkpoint"])),
-                  "model": artifact(Path(old["champion_model"]))}
-        atomic_copy(Path(record["checkpoint"]["path"]), store / "champion.pt")
-        atomic_copy(Path(record["model"]["path"]), store / "champion.nnue")
-        write_json(state_path, record)
-        return record
+        raise FileNotFoundError(f"champion registry missing: {state_path}; select an initial champion explicitly")
 
 
 def execute_stage(command: list[str], name: str, directory: Path, state: dict[str, Any]) -> None:
@@ -97,6 +88,14 @@ def run(args: argparse.Namespace) -> None:
     store = args.champion_store.resolve()
     plan_path = directory / "competition-plan.json"
     state_path = directory / "competition-state.json"
+    # Closed experiments remain readable after obsolete opponents have been removed.
+    if state_path.exists():
+        completed = json.loads(state_path.read_text())
+        if completed.get("status") in {"promoted", "rejected", "stale_incumbent"}:
+            for record in completed.get("candidate", {}).values():
+                verify_artifact(record)
+            print(f"already complete: {completed['status']}; report: {state_path}", flush=True)
+            return
     config = {"architecture": ARCHITECTURE_NAME, "train_count": args.train_count,
               "validation_count": 10000, "test_count": 10000, "epochs": args.epochs,
               "batch_size": args.batch_size, "device": args.device, "seed": args.seed,
@@ -104,14 +103,14 @@ def run(args: argparse.Namespace) -> None:
               "dataset_dir": str(dataset), "champion_store": str(store),
               "fixed_validation": artifact(DATA / "baseline-100k-v1/validation.jsonl"),
               "audit": artifact(DATA / "score-audit.json"),
-              "protected_test": artifact(ROOT / "training/runs/pikafish-full-20261011/teacher-test-manifest.json"),
+              "protected_test": artifact(args.protected_test),
               "history": artifact(ROOT / "training/runs/modelscope-nowcan-100k-v1/best.nnue"),
               "cli_engine": artifact(ROOT / "build/make/xiangqi_cli"),
               "protocol_engine": artifact(ROOT / "build/make/xiangqi_protocol"),
               "openings": artifact(args.openings),
               "arena": {"mode": "time", "depth_cap": 64, "time_limit_ms": args.time_limit_ms,
                         "min_games": 100, "min_independent_pairs": 50, "required_score": 0.70,
-                        "max_unfinished": 0, "max_plies": args.max_plies}}
+                        "max_unfinished": args.max_unfinished, "max_plies": args.max_plies}}
     if plan_path.exists():
         plan = json.loads(plan_path.read_text())
         if plan["config"] != config:
@@ -152,6 +151,7 @@ def run(args: argparse.Namespace) -> None:
                "--audit", config["audit"]["path"], "--convention", "post-mover",
                "--train-count", str(args.train_count), "--validation-count", "10000",
                "--fixed-validation", config["fixed_validation"]["path"], "--test-count", "10000",
+               "--test-manifest", config["protected_test"]["path"],
                "--seed", str(args.seed), "--output", str(dataset)]
     execute_stage(prepare, "prepare", directory, state)
     sample_report = json.loads((dataset / "sampling-report.json").read_text())
@@ -206,7 +206,7 @@ def run(args: argparse.Namespace) -> None:
         arena = run_arena(Path(config["protocol_engine"]["path"]), directory / "best.nnue", opponents,
                           arena_path, search_mode="time", depth=64, time_limit_ms=args.time_limit_ms,
                           max_plies=args.max_plies, min_games=100, min_independent_pairs=50,
-                          required_score=0.70, max_unfinished=0, openings_path=args.openings)
+                          required_score=0.70, max_unfinished=args.max_unfinished, openings_path=args.openings)
         state["stages"]["arena"].update(complete=True, passed=arena["passed"],
                                          elapsed_seconds=time.monotonic() - started, finished_at=now())
         write_json(state_path, state)
@@ -242,7 +242,7 @@ def run(args: argparse.Namespace) -> None:
     state.update(status="promoted", finished_at=now(), champion_changed=True,
                  promoted_model=str(store / "champion.nnue"))
     write_json(state_path, state)
-    print(f"promoted: {store / 'champion.nnue'}; legacy iteration files preserved", flush=True)
+    print(f"promoted: {store / 'champion.nnue'}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -260,8 +260,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openings", type=Path, default=DEFAULT_OPENINGS)
     parser.add_argument("--time-limit-ms", type=int, default=50)
     parser.add_argument("--max-plies", type=int, default=300)
+    parser.add_argument("--max-unfinished", type=int, default=5,
+                        help="maximum ply-cap unfinished games per opponent")
+    parser.add_argument("--protected-test", type=Path,
+                        default=DATA / "competition-1m-v1/test-manifest.json",
+                        help="fixed test anchors excluded from newly sampled datasets")
     args = parser.parse_args()
-    if min(args.train_count, args.epochs, args.batch_size, args.time_limit_ms, args.max_plies) <= 0:
+    if min(args.train_count, args.epochs, args.batch_size, args.time_limit_ms, args.max_plies) <= 0 or args.max_unfinished < 0:
         parser.error("sample, epoch, batch, time and ply limits must be positive")
     return args
 

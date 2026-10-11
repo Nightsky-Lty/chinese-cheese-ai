@@ -24,6 +24,14 @@ def main(args: argparse.Namespace) -> None:
     dataset = args.dataset_dir.resolve()
     directory = args.work_dir.resolve()
     directory.mkdir(parents=True, exist_ok=True)
+    state_path = directory / "baseline-state.json"
+    if state_path.exists():
+        completed = json.loads(state_path.read_text())
+        if completed.get("status") == "trained_not_promoted":
+            if file_fingerprint(Path(completed["model"])) != completed["model_sha256"]:
+                raise ValueError("completed baseline model changed")
+            print(f"already complete: {completed['model']}; use a new work directory for a new experiment", flush=True)
+            return
     train, validation = dataset / "train.jsonl", dataset / "validation.jsonl"
     report = json.loads((dataset / "sampling-report.json").read_text())
     if report.get("status") != "complete":
@@ -87,7 +95,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-dir", type=Path, default=ROOT / "training/data/modelscope-nowcan/processed/baseline-100k-v1")
     parser.add_argument("--work-dir", type=Path, default=ROOT / "training/runs/modelscope-nowcan-100k-v1")
-    parser.add_argument("--test-manifest", type=Path, default=ROOT / "training/runs/pikafish-full-20261011/teacher-test-manifest.json")
+    parser.add_argument("--test-manifest", type=Path, default=ROOT / "training/data/modelscope-nowcan/processed/competition-1m-v1/test-manifest.json")
     parser.add_argument("--cpp-engine", type=Path, default=ROOT / "build/make/xiangqi_cli")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=512)

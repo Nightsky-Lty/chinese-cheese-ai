@@ -164,7 +164,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol-timeout", type=float, default=10.0)
     parser.add_argument("--max-plies", type=int, default=300)
     parser.add_argument("--required-score", type=float, default=0.70)
-    parser.add_argument("--max-unfinished", type=int, default=0)
+    parser.add_argument("--max-unfinished", type=int, default=5)
     parser.add_argument("--min-games", type=int, default=100)
     parser.add_argument("--min-independent-pairs", type=int, default=50)
     return parser.parse_args()

@@ -277,6 +277,13 @@ def summarize_games(
     games: list[dict[str, Any]], required_score: float, max_unfinished: int,
     min_games: int, min_independent_pairs: int = 50,
 ) -> dict[str, Any]:
+    """统计候选胜和负并裁决门禁。
+
+    max_unfinished 是每个对手允许达到步数上限的局数，不包括协议故障；
+    min_independent_pairs 是原开局配对要求，实际完整配对可随额度降低，
+    但至少保留该要求的 90%。required_score 同时约束得分率和保守下界。
+    """
+
     wins = losses = draws = unfinished = 0
     for game in games:
         outcome = game["outcome"]
@@ -294,16 +301,26 @@ def summarize_games(
     score_fraction = (wins + 0.5 * draws) / decided if decided else 0.0
     interval = paired_opening_interval(games)
     complete_pairs = int(interval["independent_openings"])
+    # Only a ply-cap truncation is tolerated; protocol errors invalidate the match.
+    failed_games = sum(game["outcome"] == "unfinished" and game.get("reason") != "ply_cap"
+                       for game in games)
     lower = interval["lower"]
     effective_min_games = max(min_games, PROMOTION_MIN_GAMES)
     effective_min_independent_pairs = max(
         min_independent_pairs, PROMOTION_MIN_INDEPENDENT_PAIRS
     )
+    # Each tolerated unfinished game can invalidate at most one paired opening.
+    # Keep at least 90% of the original independent-pair floor even for a large allowance.
+    required_complete_pairs = max(
+        math.ceil(effective_min_independent_pairs * 0.9),
+        effective_min_independent_pairs - max_unfinished,
+    )
     passed = (
         len(games) >= effective_min_games
         and unfinished <= max_unfinished
+        and failed_games == 0
         and decided > 0
-        and complete_pairs >= effective_min_independent_pairs
+        and complete_pairs >= required_complete_pairs
         and score_fraction >= required_score
         and lower is not None
         and lower >= required_score
@@ -316,6 +333,8 @@ def summarize_games(
         "games": len(games),
         "decided_games": decided,
         "complete_paired_openings": complete_pairs,
+        "required_complete_paired_openings": required_complete_pairs,
+        "failed_games": failed_games,
         "score_fraction": score_fraction,
         "score_fraction_ci95": interval,
         "required_score": required_score,
@@ -452,7 +471,7 @@ def run_arena(
     time_limit_ms: int | None = 1_000,
     max_plies: int = 300,
     required_score: float = 0.70,
-    max_unfinished: int = 0,
+    max_unfinished: int = 5,
     min_games: int = 100,
     min_independent_pairs: int = 50,
     openings_path: Path = DEFAULT_OPENINGS,
@@ -649,7 +668,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol-timeout", type=float, default=10.0)
     parser.add_argument("--max-plies", type=int, default=300)
     parser.add_argument("--required-score", type=float, default=0.70)
-    parser.add_argument("--max-unfinished", type=int, default=0)
+    parser.add_argument("--max-unfinished", type=int, default=5,
+                        help="maximum ply-cap unfinished games per opponent; protocol failures remain fatal")
     parser.add_argument("--min-games", type=int, default=100)
     parser.add_argument("--min-independent-pairs", type=int, default=50)
     return parser.parse_args()

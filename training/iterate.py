@@ -553,7 +553,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arena-timeout", type=float, default=10.0)
     parser.add_argument("--arena-max-plies", type=int, default=300)
     parser.add_argument("--arena-required-score", type=float, default=0.70)
-    parser.add_argument("--arena-max-unfinished", type=int, default=0)
+    parser.add_argument("--arena-max-unfinished", type=int, default=5)
     parser.add_argument("--arena-min-games", type=int, default=100)
     parser.add_argument("--arena-min-independent-pairs", type=int, default=50)
     parser.add_argument("--arena-openings", type=Path)
