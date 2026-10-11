@@ -55,6 +55,7 @@ chinese-cheese-ai/
 │   ├── pikafish_pipeline.py          # 离线标注到 NNUE 训练/导出的一键流水线
 │   ├── modelscope_data.py            # nowcan SQLite 棋谱审计、合法重放与断点抽样
 │   ├── modelscope_baseline.py        # 独立验证集基线训练、续训、导出与一致性检查
+│   ├── modelscope_competition.py     # 百万局面训练、同单位最终测试及冠军竞争
 │   ├── run_lock.py                   # macOS/Linux/Windows 单任务独占锁
 │   ├── export_nnue.py                # 导出 XQNNUEF1 权重
 │   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
@@ -1078,6 +1079,53 @@ macOS 通用可执行文件、教师权重及许可文件保存在 `training/too
 `training/runs/modelscope-nowcan-100k-v1/best.nnue`，约 11.68 MB；三个固定局面的
 Python/C++ 评分最大绝对差约 0.000363，通过抽查。尚未做对战评测，也未晋升冠军；
 旧模型及旧数据全部保留。按当前工作约定，没有运行完整回归测试。
+
+### 百万局面训练与冠军竞争
+
+```bash
+caffeinate -i .venv/bin/python -u -m training.modelscope_competition \
+  --train-count 1000000 --epochs 20 --batch-size 512 --device cpu \
+  --time-limit-ms 50
+```
+
+`caffeinate -i` 是 macOS 的防空闲睡眠包装；Linux/Windows 省略该前缀即可。
+默认仍采用原 HalfKA 架构和随机初始化、纯评分监督，不扩大网络或混入旧标签。
+从三个原始 `train` 库按 50%/25%/25% 抽取合计 **1,000,000 条局面**，不是新增一百万
+盘棋；它可能包含之前 10 万条中的局面。沿用原来的 10,000 条独立验证数据，文件内容
+保持不变，不从训练数据划分验证集。额外从原始 `val` 库抽取 10,000 条最终测试局面，
+同样采用 50%/25%/25% 配额，整盘及镜像身份和局面键均不得跨本轮三个分区。
+旧固定测试锚点也不进入新样本。`phase=opening` 只是按子力划分的高子力阶段，
+不能据此宣称原数据中已经覆盖了真实开局。
+
+数据存放在 `training/data/modelscope-nowcan/processed/competition-1m-v1/`：
+`train.jsonl`、`validation.jsonl`、`test.jsonl`、`test-manifest.json` 和抽样报告。
+新的最终测试沿用 nowcan 原评分单位，解决旧 Pikafish 测试标签单位不一致、导致候选
+不能进入完整晋升门禁的问题；仅在选出最佳检查点后评估，不用于选择 epoch。
+它是本轮候选的留出测试，不宣称对所有历史模型都是从未见过的测试数据。
+
+任务目录为 `training/runs/modelscope-nowcan-1m-v1/`。查看进度与训练日志：
+
+```bash
+cat training/runs/modelscope-nowcan-1m-v1/competition-state.json
+tail -f training/runs/modelscope-nowcan-1m-v1/train.log
+```
+
+`competition-plan.json` 固定数据、架构、种子、引擎与对手哈希；各阶段记录耗时、
+独立日志和状态。重跑同命令可恢复抽样/训练并跳过完成阶段；竞技场中断会保留部分
+报告，用新的 `arena-attempt-*.json` 重新评测，不把不完整结果作为通过依据。
+不同配置需要新的 `--dataset-dir` / `--work-dir`，同一目录禁止并发写入。
+
+流程为：抽样 → 20 轮训练 → 验证与同单位固定测试 → 最佳权重导出 → Python/C++
+推理抽查 → 竞技场。每个对手 100 局、50 个固定开局换先；对手为手工评估、当前冠军、
+上一轮 nowcan 10 万条模型。默认每步 **50 ms**，深度上限 64，最多 300 半步。
+这是短时间预算竞争，不等同于 GUI 的 500 ms 棋力评测。晋升仍要求所有对手的得分率
+及 95% 保守下界均至少 70%，无未完成局；没有降低既有门槛。
+
+新的共同冠军目录为 `training/runs/champions/`，初始冠军从旧迭代的 `state.json`
+引用导入。只有完整门禁通过，才更新该目录的 `state.json`、`champion.pt`、
+`champion.nnue`，并保留前冠军来源。旧迭代目录不覆盖，也不自动修改 GUI 启动参数。
+竞技失败的候选和数据保留，状态为 `rejected`；已完成任务重跑不会再次抽样或自动
+复赛。后续竞争读取共同目录中的冠军；旧 `iterate.py` 仍使用它自己的迭代状态。
 
 ## 命令行使用
 

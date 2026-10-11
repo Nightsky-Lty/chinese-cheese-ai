@@ -16,10 +16,10 @@ import time
 from typing import Any
 
 from gui.protocol_client import ProtocolEngineClient, ProtocolError
-from .dataset import phase_for_fen
+from .dataset import JsonlPositionDataset, phase_for_fen
 from .diagnostics import write_json
 from .halfka import encode_fen
-from .partition import canonical_position_key, file_fingerprint, load_test_manifest
+from .partition import canonical_position_key, file_fingerprint, load_test_manifest, source_id, write_test_manifest
 from .run_lock import run_lock
 from .uci_teacher import UciTeacher
 
@@ -268,6 +268,12 @@ def prepare(args: argparse.Namespace) -> None:
             "protected_test_sha256": file_fingerprint(args.test_manifest),
             "inputs": {str(path): {"size": path.stat().st_size, "mtime_ns": path.stat().st_mtime_ns}
                        for _, _, path, _ in all_paths}}
+    # Optional fields keep existing 100k plans byte-for-byte compatible.
+    if args.fixed_validation:
+        plan["fixed_validation"] = {"path": str(args.fixed_validation.resolve()),
+                                    "sha256": file_fingerprint(args.fixed_validation)}
+    if args.test_count:
+        plan["test_count"] = args.test_count
     plan_path = output / "sampling-plan.json"
     state_path = output / "sampling.sqlite3"
     if plan_path.exists():
@@ -280,6 +286,10 @@ def prepare(args: argparse.Namespace) -> None:
                 for filename, field in (("train.jsonl", "train_sha256"), ("validation.jsonl", "validation_sha256")):
                     if file_fingerprint(output / filename) != completed[field]:
                         raise ValueError(f"completed sample file changed: {filename}")
+                if args.test_count:
+                    if file_fingerprint(output / "test.jsonl") != completed["test_sha256"]:
+                        raise ValueError("completed test samples changed")
+                    load_test_manifest(output / "test-manifest.json")
                 print(f"already complete: train={completed['train_count']} validation={completed['validation_count']}", flush=True)
                 return
     else:
@@ -298,12 +308,42 @@ def prepare(args: argparse.Namespace) -> None:
     """)
     state.executemany("INSERT OR IGNORE INTO blocked VALUES (?)", ((key,) for key in protected["position_keys"]))
     state.commit()
+    if args.fixed_validation:
+        # Freeze the original validation games before selecting test/train games.
+        # One transaction makes interrupted imports safe to repeat.
+        existing = state.execute("SELECT COUNT(*) FROM positions WHERE split='val'").fetchone()[0]
+        protected_keys = set(protected["position_keys"])
+        if not existing:
+            with args.fixed_validation.open(encoding="utf-8") as stream, state:
+                for line in stream:
+                    record = json.loads(line)
+                    encode_fen(record["fen"])
+                    key = canonical_position_key(record["fen"])
+                    if key in protected_keys:
+                        raise ValueError("fixed validation overlaps protected test")
+                    if not math.isfinite(float(record["score"])):
+                        raise ValueError("invalid fixed validation score")
+                    origin = record["provenance"]
+                    identifier = "val/" + origin["database"].split("/")[-1]
+                    state.execute("INSERT INTO positions VALUES (?,?,?,?,?,?,?)",
+                                  (key, "val", identifier, origin["rowid"], record["game_id"], record["ply"],
+                                   json.dumps(record, ensure_ascii=False, allow_nan=False)))
+                    state.execute("INSERT OR IGNORE INTO identities VALUES (?,?)", (record["game_id"], "val"))
+            existing = state.execute("SELECT COUNT(*) FROM positions WHERE split='val'").fetchone()[0]
+        if existing != args.validation_count:
+            raise ValueError("fixed validation count does not match --validation-count")
+    sample_paths = [item for item in all_paths if not (args.fixed_validation and item[0] == "val")]
+    if args.test_count:
+        sample_paths = [("test", *item) for item in source_paths(directory, "val")] + sample_paths
     started = time.monotonic()
     filters: Counter[str] = Counter()
     try:
         with ProtocolEngineClient(args.rules_engine) as client:
-            for split, name, path, ratio in all_paths:
-                quota = round((args.train_count if split == "train" else args.validation_count) * ratio)
+            for split, name, path, ratio in sample_paths:
+                total = {"train": args.train_count, "val": args.validation_count, "test": args.test_count}[split]
+                # Exact allocation also works when a requested count is not divisible by four.
+                quotas = [total // 2, total // 4, total - total // 2 - total // 4]
+                quota = quotas[[item[0] for item in SOURCES].index(name)]
                 identifier = split + "/" + name
                 count = state.execute("SELECT COUNT(*) FROM positions WHERE source=?", (identifier,)).fetchone()[0]
                 rng = random.Random(f"{args.seed}:{identifier}")
@@ -374,8 +414,28 @@ def prepare(args: argparse.Namespace) -> None:
                     connection.close()
         train = export_split(state, "train", output / "train.jsonl")
         validation = export_split(state, "val", output / "validation.jsonl")
+        test = export_split(state, "test", output / "test.jsonl") if args.test_count else 0
+        if args.fixed_validation and file_fingerprint(output / "validation.jsonl") != file_fingerprint(args.fixed_validation):
+            raise ValueError("fixed validation export changed order or content")
+        if args.test_count:
+            test_path = output / "test.jsonl"
+            samples = JsonlPositionDataset(test_path).samples
+            manifest_payload = {
+                "format": "xiangqi-fixed-test-v1", "seed": args.seed,
+                "fraction": test / (train + validation + test),
+                "groups": sorted({sample.group_key for sample in samples}),
+                "position_keys": sorted({sample.position_key for sample in samples}),
+                "source_fingerprints": {source_id(test_path): file_fingerprint(test_path)},
+            }
+            manifest_path = output / "test-manifest.json"
+            if manifest_path.exists():
+                manifest = load_test_manifest(manifest_path)
+                if any(manifest[key] != value for key, value in manifest_payload.items()):
+                    raise ValueError("fixed test manifest changed")
+            else:
+                write_test_manifest(manifest_path, manifest_payload)
         phases: Counter[str] = Counter()
-        scores: dict[str, list[float]] = {"train": [], "val": []}
+        scores: dict[str, list[float]] = {"train": [], "val": [], "test": []} if args.test_count else {"train": [], "val": []}
         for split, payload in state.execute("SELECT split,payload FROM positions"):
             record = json.loads(payload)
             phases[split + "/" + record["phase"]] += 1
@@ -391,6 +451,9 @@ def prepare(args: argparse.Namespace) -> None:
                   "elapsed_seconds": time.monotonic() - started,
                   "train_sha256": file_fingerprint(output / "train.jsonl"),
                   "validation_sha256": file_fingerprint(output / "validation.jsonl")}
+        if args.test_count:
+            report.update(test_count=test, test_sha256=file_fingerprint(output / "test.jsonl"),
+                          test_manifest_sha256=file_fingerprint(output / "test-manifest.json"))
         write_json(output / "sampling-report.json", report)
         print(f"complete train={train} validation={validation}", flush=True)
     finally:
@@ -423,13 +486,17 @@ def parse_args() -> argparse.Namespace:
             command.add_argument("--score-multiplier", type=float, default=1.0)
             command.add_argument("--train-count", type=int, default=100000)
             command.add_argument("--validation-count", type=int, default=10000)
+            command.add_argument("--fixed-validation", type=Path,
+                                 help="reuse an existing validation JSONL unchanged; reserve all its games")
+            command.add_argument("--test-count", type=int, default=0,
+                                 help="additional final-test positions from original val databases")
             command.add_argument("--per-game", type=int, default=8)
             command.add_argument("--test-manifest", type=Path, default=ROOT / "training/runs/pikafish-full-20261011/teacher-test-manifest.json")
     args = parser.parse_args()
     if args.command != "inventory" and (args.max_score <= 0 or not math.isfinite(args.max_score)):
         parser.error("max-score must be finite and positive")
     if args.command == "prepare" and (min(args.train_count, args.validation_count, args.per_game) <= 0
-                                     or not math.isfinite(args.score_multiplier) or args.score_multiplier <= 0):
+                                     or args.test_count < 0 or not math.isfinite(args.score_multiplier) or args.score_multiplier <= 0):
         parser.error("counts, per-game and multiplier must be positive")
     return args
 
