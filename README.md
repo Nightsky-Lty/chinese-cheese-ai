@@ -523,6 +523,36 @@ tail -f training/runs/architecture-1m-500ms-v1/queue.log
 防自动睡眠断言也已释放。日志和局数统计保留，但由于中途停止，没有生成完整
 `arena-500ms.json` 或两组汇总，不能当作完成的评测或冠军晋升证据。
 
+2026-10-11 已启动特征表达层扩展实验 `modelscope-nowcan-1m-acc384-v1`：
+结构为 `11340→384×2→32→1`，约 438 万参数；仅将每视角累加器从 256 扩大到
+384，隐藏层保持单层 32。复用同一份 1m 训练 / 10k 独立验证 / 10k 固定测试数据，
+从随机初始化训练 20 轮，batch 512、CPU 4 线程、AdamW 学习率 0.001、
+weight decay 0.00001、种子 2026、评分尺度 600、纯评分监督。对应训练命令为：
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 .venv/bin/python -u -m training.train \
+  training/data/modelscope-nowcan/processed/competition-1m-v1/train.jsonl \
+  --validation-dataset training/data/modelscope-nowcan/processed/competition-1m-v1/validation.jsonl \
+  --test-manifest training/data/modelscope-nowcan/processed/competition-1m-v1/test-manifest.json \
+  --output-dir training/runs/modelscope-nowcan-1m-acc384-v1 \
+  --accumulator-size 384 --hidden-sizes 32 \
+  --epochs 20 --batch-size 512 --learning-rate 0.001 --weight-decay 0.00001 \
+  --score-scale 600 --huber-beta 100 --outcome-weight 0 \
+  --seed 2026 --split-seed 2026 --device cpu
+```
+
+本次后台 `run.py` 顺序执行训练、导出 `best.nnue`、Python/C++ 原始评分抽查，
+不运行竞技场、不自动替换冠军。训练使用验证集选最佳轮次，固定测试只在训练结束后
+评估一次；新模型使用携带尺寸的 F2 格式。运行目录中 `plan.json` 保存命令和输入哈希，
+`pipeline-state.json` 保存阶段状态，`run.log` 汇总输出，`train.log` / `export.log` /
+`parity.log` 分别记录各阶段，`metrics.jsonl` 每轮记录指标，`report.json` 保存最终报告。
+`latest.pt` 每轮保存续训检查点，`best.pt` 保存验证集最优模型；同一后台脚本重跑可以
+从已保存轮次继续，但不恢复中断时尚未完成的批次。当前任务正在运行时不要重复启动。
+
+```bash
+tail -f training/runs/modelscope-nowcan-1m-acc384-v1/run.log
+```
+
 训练/验证按“源批次＋对局 ID”分组；没有可靠对局 ID 时整文件分组。
 固定测试清单绑定源文件 SHA-256，源文件缺失或改变会拒绝训练；相同局面及水平镜像
 不会跨分区，后续回放也会剔除测试局面。固定测试集不用于选择 epoch，只在结束后
