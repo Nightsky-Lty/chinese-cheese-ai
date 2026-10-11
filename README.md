@@ -53,6 +53,8 @@ chinese-cheese-ai/
 │   ├── uci_teacher.py                # 外部教师 UCI 握手与精确评分解析
 │   ├── relabel.py                    # Pikafish 重标、测试隔离与 SQLite 续标
 │   ├── pikafish_pipeline.py          # 离线标注到 NNUE 训练/导出的一键流水线
+│   ├── modelscope_data.py            # nowcan SQLite 棋谱审计、合法重放与断点抽样
+│   ├── modelscope_baseline.py        # 独立验证集基线训练、续训、导出与一致性检查
 │   ├── run_lock.py                   # macOS/Linux/Windows 单任务独占锁
 │   ├── export_nnue.py                # 导出 XQNNUEF1 权重
 │   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
@@ -999,6 +1001,83 @@ macOS 通用可执行文件、教师权重及许可文件保存在 `training/too
 工作目录保存 `pipeline-plan.json`、`pipeline-state.json`、各阶段日志、标注 `.plan.json` /
 `.report.json` / `.state.sqlite3`，以及 `model/` 下的权重、训练指标和一致性报告。
 本轮只做实际标注、训练、导出及必要检查，没有运行完整回归测试。
+
+## ModelScope nowcan 外部数据基线
+
+支持导入 [nowcan/xiangqi_train_data](https://modelscope.cn/datasets/nowcan/xiangqi_train_data)。
+本地六个 `.7z` 原包移入 `training/data/modelscope-nowcan/raw/train/` 和 `raw/val/`；
+`unpacked/train/`、`unpacked/val/` 下按 `depth11-mg`、`depth11-eg`、`depth16-eg`
+分别存放 SQLite，避免原包中同名 `XQDB.db` 覆盖。数据目录不提交 Git。
+原包合计约 12.42 GB，解压数据库约 84.41 GB；`inventory.json` 记录发布者 SHA-256
+和本地文件大小。原库只读打开，JSON 棋局不作为代码执行，也不使用 `ORDER BY RANDOM()`
+全扫描大库。
+
+`training.modelscope_data` 提供三个步骤：
+
+```bash
+.venv/bin/python -u -m training.modelscope_data inventory
+.venv/bin/python -u -m training.modelscope_data audit --source-split all --samples 32 \
+  --output training/data/modelscope-nowcan/processed/score-audit.json
+.venv/bin/python -u -m training.modelscope_data prepare \
+  --audit training/data/modelscope-nowcan/processed/score-audit.json \
+  --convention post-mover --train-count 100000 --validation-count 10000 \
+  --output training/data/modelscope-nowcan/processed/baseline-100k-v1
+```
+
+评分视角须先审计：原记录 `score` 对应落子后的局面，本批评分符合刚走棋一方的视角，
+转换为本项目的落子后当前行棋方视角时取反。它的数值不保证等同于新版 Pikafish UCI cp，
+因此保留原数据评分单位（`score_multiplier=1`），单独训练，不直接混合旧标签。
+`score_scale=600` 仍是数值归一化参数，不意味着已把不同教师单位统一。
+
+抽样配额为中盘文件 50%、深度 11 残局 25%、深度 16 残局 25%；文件分类与实际
+子力阶段不同，报告另统计真实阶段。随机选棋局，每局最多抽 8 个局面，C++ 规则引擎完整
+重放验证后才接受；任何非法着会拒绝整局。过滤 `skip_step` 内人为零分、绝对值大于
+3000 的将杀/极端标签；`result=2` 保留为未知，不伪造和棋。
+全局按局面及水平镜像去重，也排除现有固定测试锚点；整局镜像身份用于跨源重复检查。
+先抽独立 `val`，再抽 `train`，避免这次实际使用的训练/验证样本重复。
+
+`train.jsonl` 含 100,000 条训练局面，`validation.jsonl` 含独立原始 `val` 文件抽取的
+10,000 条局面，不再从这 100,000 条训练样本中划分验证集。随机种子、输入大小/时间、
+规则引擎与审计哈希固定在 `sampling-plan.json`；`sampling.sqlite3` 每盘提交并保存随机
+状态，中断后重跑同命令即可继续，完成后原子导出。统计见 `sampling-report.json`。
+
+保持现有 `11340→256×2→32→1` HalfKA NNUE 架构，从随机初始化做纯评分基线：
+
+一键执行训练、最佳检查点导出及 Python/C++ 推理抽查：
+
+```bash
+.venv/bin/python -u -m training.modelscope_baseline \
+  --epochs 20 --batch-size 512 --device cpu
+```
+
+日志和配置保存在 `training/runs/modelscope-nowcan-100k-v1/`。中断后重跑同一命令
+从 `latest.pt` 继续，已完成的步骤不重复执行；更换实验配置需指定新的 `--work-dir`。
+其中 `--epochs` 是目标总轮数。也可仅调用训练器：
+
+```bash
+.venv/bin/python -u -m training.train \
+  training/data/modelscope-nowcan/processed/baseline-100k-v1/train.jsonl \
+  --validation-dataset training/data/modelscope-nowcan/processed/baseline-100k-v1/validation.jsonl \
+  --test-manifest training/runs/pikafish-full-20261011/teacher-test-manifest.json \
+  --skip-fixed-test --output-dir training/runs/modelscope-nowcan-100k-v1 \
+  --epochs 20 --batch-size 512 --score-scale 600 --outcome-weight 0 --device cpu
+```
+
+`--validation-dataset` 优先于 `--validation-fraction`；验证集只评价，不参与反向传播。
+续训元数据包含其样本摘要及数据源哈希。`--skip-fixed-test` 仍保护旧测试锚点，但不拿
+另一教师单位的旧测试评分与本次 MAE 混算；本轮没有新的独立最终测试成绩。
+设备可改成 `cpu` 或服务器 `cuda`；Mac 是否支持/受益于 MPS 以实际运行检查为准。
+模型保留 `best.pt`、`latest.pt`、导出 `.nnue` 和诊断报告，不自动替换冠军。
+后续扩充网络应沿用本次固定样本、种子与对战预算，以便单独比较结构的效果。
+
+2026-10-11 已完成这次 20 轮 CPU 基线：100,000 条训练局面来自 12,868 盘棋，
+10,000 条独立验证局面来自 1,295 盘棋；六个原包均通过发布者 SHA-256 核对。
+最佳检查点为第 6 轮，验证 Huber loss 为 0.842606、MAE 为 550.68（原数据评分单位，
+不可直接与旧教师的 MAE 比较）。后续训练损失继续下降但验证损失未改善，说明本轮出现
+泛化差距，不能把训练完成当作棋力提升。导出文件为
+`training/runs/modelscope-nowcan-100k-v1/best.nnue`，约 11.68 MB；三个固定局面的
+Python/C++ 评分最大绝对差约 0.000363，通过抽查。尚未做对战评测，也未晋升冠军；
+旧模型及旧数据全部保留。按当前工作约定，没有运行完整回归测试。
 
 ## 命令行使用
 

@@ -212,6 +212,7 @@ def split_metadata(
     seed: int,
     test_manifest: Path,
     fixed_test_samples: list[TrainingSample] | None = None,
+    validation_samples: list[TrainingSample] | None = None,
 ) -> dict[str, Any]:
     """记录真实训练/验证/固定测试划分，避免静默更换续训数据。"""
 
@@ -227,7 +228,7 @@ def split_metadata(
 
     partition_indices = {
         "train": indices(train_loader),
-        "validation": indices(validation_loader),
+        "validation": [] if validation_samples is not None else indices(validation_loader),
         "test": [],
     }
     partition_samples = {
@@ -236,6 +237,8 @@ def split_metadata(
     }
     if fixed_test_samples is not None:
         partition_samples["test"] = fixed_test_samples
+    if validation_samples is not None:
+        partition_samples["validation"] = validation_samples
     manifest_bytes = test_manifest.read_bytes()
     return {
         "version": 1,
@@ -389,6 +392,7 @@ def make_loaders(
     seed: int,
     test_manifest: Path | None = None,
     split_seed: int | None = None,
+    validation_dataset: Dataset[TrainingSample] | None = None,
 ) -> tuple[
     DataLoader[NnueBatch], DataLoader[NnueBatch] | None,
     DataLoader[NnueBatch] | None, int,
@@ -401,6 +405,7 @@ def make_loaders(
         validation_fraction: 留作验证集的比例，范围为 ``[0, 1)``。
         workers: DataLoader 子进程数量。
         seed: 数据拆分和训练集洗牌使用的随机种子。
+        validation_dataset: 独立验证集；提供后不再从训练集划分验证局。
 
     返回:
         ``(training_loader, validation_loader, test_loader, dropped)``。
@@ -409,12 +414,35 @@ def make_loaders(
     samples = [dataset[index] for index in range(len(dataset))]
     manifest = load_test_manifest(test_manifest) if test_manifest else None
     train_indices, validation_indices, test_indices, dropped = split_indices(
-        samples, validation_fraction, seed if split_seed is None else split_seed, manifest
+        samples, 0.0 if validation_dataset is not None else validation_fraction,
+        seed if split_seed is None else split_seed, manifest
     )
+    external_validation_indices: list[int] = []
+    if validation_dataset is not None:
+        validation_samples = [validation_dataset[index] for index in range(len(validation_dataset))]
+        validation_groups = {sample.group_key for sample in validation_samples}
+        if validation_groups & {sample.group_key for sample in samples}:
+            raise ValueError("independent validation and training contain the same game group")
+        protected = set(manifest["position_keys"]) if manifest else set()
+        protected_groups = set(manifest["groups"]) if manifest else set()
+        seen: set[str] = set()
+        for index, sample in enumerate(validation_samples):
+            if sample.position_key in protected or sample.group_key in protected_groups or sample.position_key in seen:
+                dropped += 1
+                continue
+            seen.add(sample.position_key)
+            external_validation_indices.append(index)
+        original_count = len(train_indices)
+        train_indices = [index for index in train_indices if samples[index].position_key not in seen]
+        dropped += original_count - len(train_indices)
+        if not external_validation_indices:
+            raise ValueError("independent validation set is empty after isolation")
     if not train_indices:
         raise ValueError("no training samples remain after fixed-test isolation")
     training_set = Subset(dataset, train_indices)
     validation_set = Subset(dataset, validation_indices) if validation_indices else None
+    if validation_dataset is not None:
+        validation_set = Subset(validation_dataset, external_validation_indices)
     test_set = Subset(dataset, test_indices) if test_indices else None
     generator = torch.Generator().manual_seed(seed)
 
@@ -461,6 +489,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--validation-dataset", nargs="+", type=Path,
+        help="independent validation JSONL files; overrides validation-fraction without splitting training games",
+    )
+    parser.add_argument(
+        "--skip-fixed-test", action="store_true",
+        help="keep fixed-test isolation but skip final scoring when external labels use a different teacher unit",
+    )
     parser.add_argument(
         "--test-manifest", type=Path, default=DEFAULT_TEST_MANIFEST,
         help="permanent held-out game and mirrored-position manifest",
@@ -538,6 +574,15 @@ def main() -> None:
     known_results = sum(
         sample.result is not None for source in datasets for sample in source.samples
     )
+    external_validation: Dataset[TrainingSample] | None = None
+    if args.validation_dataset:
+        if {path.resolve() for path in args.dataset} & {path.resolve() for path in args.validation_dataset}:
+            raise ValueError("validation files must not also be training files")
+        validation_sources = [JsonlPositionDataset(
+            path, score_clip=args.score_clip, quarantine_sources=quarantine_sources,
+            narrow_score_limit=narrow_score_limit,
+        ) for path in args.validation_dataset]
+        external_validation = validation_sources[0] if len(validation_sources) == 1 else ConcatDataset(validation_sources)
     if not args.test_manifest.is_file():
         raise FileNotFoundError(
             f"fixed test manifest missing: {args.test_manifest}; "
@@ -551,15 +596,23 @@ def main() -> None:
         args.seed,
         args.test_manifest,
         args.split_seed,
+        external_validation,
     )
-    test_loader, fixed_test_samples = load_fixed_test_data(
-        args.test_manifest,
-        quarantine_sources,
-        narrow_score_limit,
-        args.score_clip,
-        args.batch_size,
-        args.workers,
-    )
+    if args.skip_fixed_test:
+        test_loader, fixed_test_samples = None, []
+    else:
+        test_loader, fixed_test_samples = load_fixed_test_data(
+            args.test_manifest,
+            quarantine_sources,
+            narrow_score_limit,
+            args.score_clip,
+            args.batch_size,
+            args.workers,
+        )
+    external_validation_samples = None
+    if external_validation is not None and validation_loader is not None:
+        assert isinstance(validation_loader.dataset, Subset)
+        external_validation_samples = [external_validation[index] for index in validation_loader.dataset.indices]
 
     current_split = split_metadata(
         dataset,
@@ -567,10 +620,11 @@ def main() -> None:
         validation_loader,
         test_loader,
         dropped,
-        validation_fraction=args.validation_fraction,
+        validation_fraction=0.0 if external_validation is not None else args.validation_fraction,
         seed=args.split_seed,
         test_manifest=args.test_manifest,
         fixed_test_samples=fixed_test_samples,
+        validation_samples=external_validation_samples,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_config = {
@@ -587,6 +641,7 @@ def main() -> None:
             "result_known_count": known_results,
             "result_unknown_count": len(dataset) - known_results,
             "quarantined_count": quarantined_count,
+            "independent_validation_paths": [str(path.resolve()) for path in args.validation_dataset or []],
         },
         "split": current_split,
         "device": str(device),
