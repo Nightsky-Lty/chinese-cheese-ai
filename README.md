@@ -483,7 +483,40 @@ Huber 阈值也除以同一尺度；`score`、MAE 和诊断分位数仍用引擎
 该流程会训练、导出、检查推理一致性并参加现有冠军门禁；通过才晋升。
 需要仅训练对照而不参与晋升时，可用 `training.modelscope_baseline`，同样支持
 两个尺寸参数。GUI 的 `--nnue` 仍传模型路径，不需额外指定结构。
-本次实现仅扩展配置能力，未启动上述百万样本训练，现有冠军保持不变。
+上述两组百万样本训练已完成，原来的单层 32 维、1m 数据冠军保持不变。
+在双方每步 50ms、深度上限 64、100 局固定开局换先的评测中，加宽模型对该冠军
+为 24 胜 / 4 和 / 68 负 / 4 未完成，得分率 27.08%；加深模型为
+34 胜 / 3 和 / 60 负 / 3 未完成，得分率 36.60%。得分率排除未完成对局。
+这些结果仅代表短时间控制，不直接等同于 GUI 每步 500ms 的棋力。
+
+2026-10-11 已启动两组 500ms 重测：复用相同引擎、模型和开局，每组仍为 100 局、
+50 个开局换先对，深度上限 64、每局最多 300 半步；只对阵原来的 1m 冠军。
+两组串行执行，不重新训练、不自动晋升，也不覆盖原来的 `arena.json`。
+单组独立重测命令如下（加深组替换模型与输出目录中的 `wide64` 为 `deep32x2`）：
+
+```bash
+.venv/bin/python -u -m training.arena \
+  --candidate training/runs/modelscope-nowcan-1m-wide64-v1/best.nnue \
+  --champion training/runs/modelscope-nowcan-1m-v1/best.nnue \
+  --no-hand --search-mode time --depth 64 --time-limit-ms 500 \
+  --min-games 100 --min-independent-pairs 50 --max-plies 300 \
+  --max-unfinished 5 \
+  --output training/runs/modelscope-nowcan-1m-wide64-v1/arena-500ms.json
+```
+
+本次后台队列的记录保存在 `training/runs/architecture-1m-500ms-v1/`：
+`plan.json` 固定命令及输入哈希，`queue-state.json` 每完成一局更新状态、计数与时间，
+`queue.log` 汇总输出，`wide64.log` / `deep32x2.log` 分别记录两组对战。
+每组结束后写入对应模型目录的 `arena-500ms.json`（完整走法、协议记录和统计）；
+全部结束后生成 `comparison.json`，并列保存 50ms / 500ms 结果。
+若进程失败，状态会记录错误；这些运行文件不随 Git 推送。后台队列已经启动时，
+不要再运行上面的单组命令；竞技场也会拒绝覆盖已有报告。
+
+```bash
+# 每局结束后可在状态中看到 completed_games；比赛进行中日志可能暂时没有新行。
+.venv/bin/python -m json.tool training/runs/architecture-1m-500ms-v1/queue-state.json
+tail -f training/runs/architecture-1m-500ms-v1/queue.log
+```
 
 训练/验证按“源批次＋对局 ID”分组；没有可靠对局 ID 时整文件分组。
 固定测试清单绑定源文件 SHA-256，源文件缺失或改变会拒绝训练；相同局面及水平镜像
