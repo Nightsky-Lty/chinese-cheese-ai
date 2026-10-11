@@ -455,7 +455,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="reset the best validation loss after loading a checkpoint",
     )
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=10,
+                        help="target final epoch; 0 with --resume only finalizes an interrupted run")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
@@ -497,8 +498,8 @@ def main() -> None:
     """执行数据加载、可选续训、逐轮训练以及最佳/最新检查点保存。"""
 
     args = parse_args()
-    if args.epochs <= 0 or args.batch_size <= 0:
-        raise ValueError("epochs and batch size must be positive")
+    if args.epochs < 0 or (args.epochs == 0 and not args.resume) or args.batch_size <= 0:
+        raise ValueError("epochs must be positive (or 0 with resume); batch size must be positive")
     if not 0.0 <= args.validation_fraction < 1.0:
         raise ValueError("validation fraction must be in [0, 1)")
     if args.outcome_weight < 0.0 or args.outcome_scale <= 0.0 or args.score_scale <= 0.0:

@@ -19,6 +19,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 /training/runs/
+/training/tools/
 
 # GUI screenshots and local board calibration
 /gui/output/

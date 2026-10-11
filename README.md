@@ -4,9 +4,10 @@
 象棋内核：它能够解析局面、生成合法走法、执行和撤销走法、维护对局历史，
 并使用手工评估或 HalfKA NNUE 模型与 Alpha-Beta 搜索选择着法。
 
-项目的目标不是调用现成象棋引擎，而是逐步完成一套自己的 AI：先建立可靠的
+项目的目标不是用现成象棋引擎替代自己的内核，而是逐步完成一套自己的 AI：先建立可靠的
 规则与传统搜索基线，再加入神经网络训练和推理，最后通过独立的 GUI 适配层与
-棋盘界面交互。
+棋盘界面交互。允许用外部引擎作离线教师：Pikafish 只负责训练数据标注，
+实际行棋仍由本项目的搜索器和训练出的 HalfKA NNUE 完成。
 
 > 当前状态：规则引擎、手工评估、Negamax、Alpha-Beta/PVS、静态搜索、迭代加深、
 > 置换表、“三次重复、长将、长捉、无吃子”的简化裁决，以及 float32 NNUE
@@ -49,6 +50,10 @@ chinese-cheese-ai/
 │   ├── arena.py                      # 多对手、换先和固定预算对战评测
 │   ├── baseline.py                   # 可信教师数据的基线训练与晋升闭环
 │   ├── iterate.py                    # 多代数据生成、回放训练、导出和恢复
+│   ├── uci_teacher.py                # 外部教师 UCI 握手与精确评分解析
+│   ├── relabel.py                    # Pikafish 重标、测试隔离与 SQLite 续标
+│   ├── pikafish_pipeline.py          # 离线标注到 NNUE 训练/导出的一键流水线
+│   ├── run_lock.py                   # macOS/Linux/Windows 单任务独占锁
 │   ├── export_nnue.py                # 导出 XQNNUEF1 权重
 │   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
 │   ├── examples/positions.fen        # 批量标注输入示例
@@ -918,6 +923,82 @@ B 对 A 的配对开局保守 95% 区间为 36.50%～76.55%，包含 50%，尚�
 `plan.json`、执行状态 `execution.json`、训练/对战日志和两组模型均保留，不随 Git 推送。
 `comparison.json` 汇总原始指标，`interpretation.json` 保存配对差异、实际完成搜索深度和结论边界；
 `run_experiment.py` 与 `analyze_results.py` 保存本轮执行和分析过程，没有调参后反复挑选结果。
+
+### Pikafish 离线教师（2026-10-11）
+
+新增 `training.relabel` 和 `training.pikafish_pipeline`。它们不替换 C++ 搜索内核，
+不自动晋升模型，也不启动 GUI 点击。教师使用标准 UCI，不经 shell 拼接命令。
+
+本机已下载并校验 [Pikafish 2026-09-06 官方发布包](https://github.com/official-pikafish/Pikafish/releases/tag/Pikafish-2026-09-06)：
+发布包 SHA-256 为 `41952bbfe2520faceb5902c69e6ab4845cc999841d2b49a95cc1be7867a25e5b`。
+macOS 通用可执行文件、教师权重及许可文件保存在 `training/tools/pikafish-2026-09-06/`，
+不随 Git 推送。其他机器需要自己下载官方对应平台的可执行文件和网络，并替换命令中的路径。
+官方教师权重附带 `NNUE-License.md`，注明未经许可不得商用；不要把 GPL 源码许可
+与网络权重许可混为一谈。使用前应阅读发行包中的许可文件。
+
+数据约定与保护：
+
+- 原数据只读：新评分写到新目录，原评分、原赛果、批次、对局和行号保存在 `original` 元数据。
+- `development` 整局排除原固定测试对局，也排除测试局面的左右镜像；每个新 `game_id`
+  绑定原批次＋对局，同一局不会跨训练和验证。新的验证分区不保证与旧手工数据分区完全相同。
+- `fixed-test` 只取原固定测试区的局面，用教师标签建立独立、冻结的新测试清单，不把它送入训练。
+  旧的测试清单及原始文件保持不变。
+- `score` 是当前行棋方视角的 Pikafish UCI `cp`；默认乘数为 1，训练仍使用 `score/600`。
+  **教师 cp 不假定等于原手工子力单位**，新旧标签不混在一起，两个不同教师测试集的 MAE 不能直接比较。
+- 首轮不学习弱引擎对局的赛果：输出 `result=null`，旧赛果仅保留作追溯；赛果监督权重为 0。
+- 将杀、无走法、只有上下界的评分，以及绝对值超过 3000 的标签不用于普通评分训练；
+  它们计入过滤统计，不伪装成精确 cp 标签。5,000 节点是教师的软预算，记录实际节点及深度。
+- 单线程、每局面 `ucinewgame` 清空 Hash；FEN 补齐为六字段，不伪造历史走法。
+  本轮是无历史 FEN 标注，不用它学习长将、长捉等历史责任。
+- 限量抽样时按棋子数划分的开局、中盘、残局轮转采样；不额外制造随机非法棋盘。
+
+一键执行本轮小批量配置：
+
+```bash
+.venv/bin/python -u -m training.pikafish_pipeline training/runs/hand-teacher-v2/*.jsonl \
+  --engine training/tools/pikafish-2026-09-06/Pikafish-MacOS-universal \
+  --network training/tools/pikafish-2026-09-06/pikafish.nnue \
+  --work-dir training/runs/pikafish-pilot-20261011 \
+  --limit 10000 --test-limit 1000 --nodes 5000 --epochs 20
+```
+
+已跑通这条命令：开发区 10,000 条候选留下 5,502 条精确标签，其中训练 5,009、验证 493；
+固定测试区 1,000 条候选留下 551 条标签。完成 20 轮随机初始化训练，验证选中第 19 轮，
+导出 `model/best.nnue` 并通过 Python/C++ 评分检查。小批量教师测试 MAE 为 222.52 cp，
+只能说明流程已跑通，不能据此宣称棋力提升或覆盖原模型。
+
+对现有全部可信局面执行标注和训练：
+
+```bash
+.venv/bin/python -u -m training.pikafish_pipeline training/runs/hand-teacher-v2/*.jsonl \
+  --engine training/tools/pikafish-2026-09-06/Pikafish-MacOS-universal \
+  --network training/tools/pikafish-2026-09-06/pikafish.nnue \
+  --work-dir training/runs/pikafish-full-20261011 \
+  --limit 0 --test-limit 0 --nodes 5000 --epochs 20
+```
+
+`--limit 0` / `--test-limit 0` 表示用完相应分区的去重候选，不表示训练集可以使用测试局。
+本轮全量任务已完成。开发区 87,008 个候选局面中保留 49,787 条精确评分，过滤 34,906 条界限分和 2,315 条将死分；按对局划分为训练 45,154 条、验证 4,633 条。原固定测试区单独重标注后保留 6,451 条，不参与训练。随机初始化训练 20 轮，最佳验证模型为第 6 轮；固定测试集评分损失为 `0.170658`，MAE 为 `143.24` Pikafish cp（不能直接与旧手工教师的 MAE 比较）。导出模型位于 `training/runs/pikafish-full-20261011/model/best.nnue`，Python/C++ 三个局面的推理一致性检查已通过，最大原始分差约 `0.0000611`。
+
+目前状态为 `trained_not_promoted`：冠军未变更，尚未完成棋力对战，不能仅凭拟合误差宣称新模型更强。完整记录见本轮目录下的 `pipeline-state.json`、`model/report.json`、`model/metrics.jsonl` 和各阶段日志。按要求，本轮未运行全量回归测试，仅执行必要的语法检查、实际标注/训练与导出一致性检查。
+
+只标注、不训练，可直接调用：
+
+```bash
+.venv/bin/python -u -m training.relabel training/runs/hand-teacher-v2/*.jsonl \
+  --engine training/tools/pikafish-2026-09-06/Pikafish-MacOS-universal \
+  --network training/tools/pikafish-2026-09-06/pikafish.nnue \
+  --output training/runs/my-pikafish/development.jsonl \
+  --partition development --limit 10000 --nodes 5000
+```
+
+续标/续训：中断后重跑**完全相同的命令**。SQLite 每条提交，完成后才原子导出 JSONL；
+输入、教师可执行文件、教师网络、固定测试清单或预算改变时拒绝续用原目录。
+`.lock` 防止两进程写同一任务。训练从 `latest.pt` 恢复到目标轮次；若最后一轮已经完成而
+报告未落盘，会用 `--epochs 0 --resume ...` 只收尾，不额外增加轮次。
+工作目录保存 `pipeline-plan.json`、`pipeline-state.json`、各阶段日志、标注 `.plan.json` /
+`.report.json` / `.state.sqlite3`，以及 `model/` 下的权重、训练指标和一致性报告。
+本轮只做实际标注、训练、导出及必要检查，没有运行完整回归测试。
 
 ## 命令行使用
 
