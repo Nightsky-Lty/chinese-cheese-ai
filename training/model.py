@@ -17,6 +17,30 @@ HIDDEN_SIZE = 32
 EVALUATION_LIMIT = 28_000
 ARCHITECTURE_NAME = "halfka-11340-256x2-32-1-f32"
 DEFAULT_SCORE_SCALE = 600.0
+MAX_LAYER_WIDTH = 2048
+MAX_HIDDEN_LAYERS = 8
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    """网络尺寸；输入保持 HalfKA，输出保持一个分数，所有中间层可配置。"""
+
+    accumulator_size: int = ACCUMULATOR_SIZE
+    hidden_sizes: tuple[int, ...] = (HIDDEN_SIZE,)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "hidden_sizes", tuple(self.hidden_sizes))
+        widths = (self.accumulator_size, *self.hidden_sizes)
+        if not 1 <= len(self.hidden_sizes) <= MAX_HIDDEN_LAYERS:
+            raise ValueError("hidden layer count must be between 1 and 8")
+        if any(type(width) is not int or not 1 <= width <= MAX_LAYER_WIDTH for width in widths):
+            raise ValueError("layer widths must be integers between 1 and 2048")
+
+    @property
+    def name(self) -> str:
+        """生成包含全部尺寸的实验名称，避免不同架构混淆。"""
+        hidden = "-".join(map(str, self.hidden_sizes))
+        return f"halfka-{FEATURE_DIMENSIONS}-{self.accumulator_size}x2-{hidden}-1-f32"
 
 
 @dataclass
@@ -98,33 +122,53 @@ def pack_feature_lists(feature_lists: Sequence[Sequence[int]]) -> tuple[Tensor, 
 class HalfKANetwork(nn.Module):
     """参数形状和排列顺序与 C++ ``NnueNetwork`` 完全一致的训练网络。
 
-    网络结构为共享特征变换 ``11340→256``、双视角拼接 ``512``、隐藏层
-    ``512→32`` 和输出层 ``32→1``。两处隐藏输出都使用 ``clamp(0, 1)``。
+    默认结构为 ``11340→256×2→32→1``，累加器宽度及各隐藏层宽度可配置。
+    特征变换及每个隐藏层使用 ``clamp(0, 1)``，输出层不截断。
     """
 
-    def __init__(self, score_scale: float = 1.0) -> None:
+    def __init__(self, score_scale: float = 1.0, *,
+                 accumulator_size: int = ACCUMULATOR_SIZE,
+                 hidden_sizes: Sequence[int] = (HIDDEN_SIZE,)) -> None:
+        """构造网络。
+
+        参数:
+            score_scale: 原始输出到引擎分数的倍数，正式训练默认使用 600。
+            accumulator_size: 每个视角共享特征变换的宽度，双视角拼接后为两倍。
+            hidden_sizes: 从前到后每个隐藏层的宽度；默认仅一个 32 维隐藏层。
+        """
         super().__init__()
         if not math.isfinite(score_scale) or score_scale <= 0.0:
             raise ValueError("score scale must be finite and positive")
         # 不属于 state_dict；检查点的 scoring 元数据决定末层输出单位。
         self.score_scale = float(score_scale)
+        self.config = NetworkConfig(accumulator_size, tuple(hidden_sizes))
         self.feature_weights = nn.Parameter(
-            torch.empty(FEATURE_DIMENSIONS, ACCUMULATOR_SIZE)
+            torch.empty(FEATURE_DIMENSIONS, accumulator_size)
         )
-        self.feature_bias = nn.Parameter(torch.zeros(ACCUMULATOR_SIZE))
-        self.hidden = nn.Linear(CONCATENATED_SIZE, HIDDEN_SIZE)
-        self.output = nn.Linear(HIDDEN_SIZE, 1)
+        self.feature_bias = nn.Parameter(torch.zeros(accumulator_size))
+        # 保留第一层的 hidden.* 参数名，使现有模型无需改写即可加载。
+        self.hidden = nn.Linear(accumulator_size * 2, self.config.hidden_sizes[0])
+        self.extra_hidden = nn.ModuleList(
+            nn.Linear(previous, following)
+            for previous, following in zip(self.config.hidden_sizes, self.config.hidden_sizes[1:])
+        )
+        self.output = nn.Linear(self.config.hidden_sizes[-1], 1)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """初始化稀疏特征变换和两个全连接层的可训练参数。"""
+        """初始化稀疏特征变换、全部隐藏层和线性输出层的可训练参数。"""
 
         nn.init.normal_(self.feature_weights, mean=0.0, std=0.01)
         nn.init.zeros_(self.feature_bias)
-        nn.init.xavier_uniform_(self.hidden.weight)
-        nn.init.zeros_(self.hidden.bias)
+        for layer in self.dense_layers():
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
         nn.init.normal_(self.output.weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.output.bias)
+
+    def dense_layers(self) -> tuple[nn.Linear, ...]:
+        """按推理顺序返回全部隐藏层，不包含最终线性输出层。"""
+        return (self.hidden, *self.extra_hidden)
 
     def _transform(self, indices: Tensor, offsets: Tensor) -> Tensor:
         """计算每个样本的第一层未激活累加器。
@@ -134,7 +178,7 @@ class HalfKANetwork(nn.Module):
             offsets: 每个样本在 ``indices`` 中的起止边界。
 
         返回:
-            形状为 ``[batch, 256]`` 的 ``bias + Σ feature_weight``。
+            形状为 ``[batch, accumulator_size]`` 的 ``bias + Σ feature_weight``。
 
         异常:
             TypeError: 编号或边界不是 ``torch.long``。
@@ -179,7 +223,7 @@ class HalfKANetwork(nn.Module):
             black_offsets: 黑方视角样本边界。
 
         返回:
-            ``(red_accumulator, black_accumulator)``，形状均为 ``[batch, 256]``。
+            ``(red_accumulator, black_accumulator)``，宽度为配置的累加器尺寸。
         """
 
         return (
@@ -226,6 +270,7 @@ class HalfKANetwork(nn.Module):
             ``(raw_output, accumulator_pre_activation, hidden_pre_activation)``。
             输出形状为 ``[batch]``；乘以 score_scale 得引擎分值。后两项用于
             测量 clipped-ReLU 的上下饱和比例，不改变网络计算。
+            多隐藏层的激活前值按维度拼接，诊断按全部隐藏神经元汇总。
 
         异常:
             ValueError: 行棋方张量形状与批大小不匹配。
@@ -239,12 +284,18 @@ class HalfKANetwork(nn.Module):
         accumulator_pre_activation = torch.cat((red, black), dim=0)
         red = torch.clamp(red, 0.0, 1.0)
         black = torch.clamp(black, 0.0, 1.0)
-        # C++ 约定把当前方累加器放前 256 维，对方累加器放后 256 维。
+        # C++ 约定当前方累加器在前，对方累加器在后。
         red_first = torch.cat((red, black), dim=1)
         black_first = torch.cat((black, red), dim=1)
         combined = torch.where(red_to_move[:, None], red_first, black_first)
-        hidden_pre_activation = self.hidden(combined)
-        hidden = torch.clamp(hidden_pre_activation, 0.0, 1.0)
+        hidden = combined
+        pre_activations = []
+        for layer in self.dense_layers():
+            values = layer(hidden)
+            pre_activations.append(values)
+            hidden = torch.clamp(values, 0.0, 1.0)
+        # 多隐藏层诊断按神经元汇总；保留现有诊断接口的三元组约定。
+        hidden_pre_activation = torch.cat(pre_activations, dim=1)
         return (
             self.output(hidden).squeeze(1),
             accumulator_pre_activation,

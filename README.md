@@ -58,7 +58,7 @@ chinese-cheese-ai/
 │   ├── modelscope_competition.py     # 百万局面训练、同单位最终测试及冠军竞争
 │   ├── DATA_FORMAT.md               # ModelScope 样本、模型、配置与日志格式
 │   ├── run_lock.py                   # macOS/Linux/Windows 单任务独占锁
-│   ├── export_nnue.py                # 导出 XQNNUEF1 权重
+│   ├── export_nnue.py                # 导出兼容旧版的 F1 / 可配置架构 F2 权重
 │   ├── verify_cpp.py                 # Python/C++ 推理一致性验证
 │   ├── examples/positions.fen        # 批量标注输入示例
 │   └── tests/                        # Python 训练端自动测试
@@ -318,7 +318,7 @@ AI 走法已经确认、正在等待对手时，也会逐帧尝试从部分棋�
   `AXRaise` 精确置顶。
 - Windows：pywin32、Win32 窗口 API、`mss` 截图。
 - 输入控制：`pyautogui`，默认关闭真实点击。
-- 数据交换：FEN、JSON、NPZ、标准输入输出，以及自定义 `XQNNUEF1` 权重格式。
+- 数据交换：FEN、JSON、NPZ、标准输入输出，以及自定义 `XQNNUEF1/F2` 权重格式。
 - 进程通信：单行请求/响应协议，Python `subprocess.Popen` 保持 C++
   `GameHistory` 和置换表长期存活。
 - 测试：C++/CTest 与 Python `unittest`。
@@ -399,7 +399,7 @@ AI 走法已经确认、正在等待对手时，也会逐帧尝试从部分棋�
 向量：标准初始局面虽然有 11340 维，但每个视角只激活 32 项。双方将帅也作为
 普通棋子特征被显式包含，这是 HalfKA 与 HalfKP 的主要区别。
 
-当前 C++ 推理网络固定为：
+Python 训练与 C++ 推理共同支持可配置结构，默认仍为：
 
 ```text
 HalfKA 11340 → 共享特征变换 256
@@ -410,6 +410,12 @@ ClippedReLU → 全连接 32 → ClippedReLU → 输出 1
 `NnueNetwork` 能从局面完整计算双方累加器、执行 float32 前向传播并加载或保存
 版本化二进制权重。`NnueEvaluator` 已接入搜索器的统一评估接口。网络输出直接以
 引擎分值为单位，并限制在 ±28000 内，避免与搜索器的将杀分数范围冲突。
+
+`--accumulator-size` 配置共享特征变换宽度（默认 256）；`--hidden-sizes` 按顺序
+配置全部隐藏层宽度（默认 `32`）。例如 `64` 是单层加宽，`32 32` 是两层，
+`128 64 32` 是三层。累加器与每个隐藏层的激活仍为 `clamp(0, 1)`，输出为不截断的
+线性层。每层宽度支持 1～2048，隐藏层数量支持 1～8。HalfKA 输入 11340 和单分数
+输出 1 是特征与评估接口约定，不作为可任意修改的尺寸。
 
 权重文件统一使用小端编码，头部依次为 8 字节魔数 `XQNNUEF1`，以及版本、输入
 维度、累加器宽度和隐藏层宽度四个 `uint32`。后续数据均为 float32，排列顺序为：
@@ -423,10 +429,16 @@ output_bias[1]
 output_weights[32]
 ```
 
+默认架构继续导出完全相同的 `XQNNUEF1`。非默认架构导出 `XQNNUEF2`：头部为
+魔数、版本 2、输入维度、累加器宽度、隐藏层数量，随后追加各隐藏层宽度的
+`uint32` 列表；参数依次为特征偏置/权重、逐层隐藏偏置/权重、输出偏置/权重。
+所有参数仍为小端 float32。C++ 自动识别两版，并在分配参数前验证尺寸及文件长度。
+
 搜索开始时会为根局面全量刷新一次红黑累加器。随后普通走子通过减去旧位置特征、
 加入新位置特征并移除被吃棋子完成增量更新；观察方自己的将帅移动会改变全部
 HalfKA 特征的将帅桶，因此只全量刷新该方累加器。每层搜索保存累加器快照，撤销
-走法时精确恢复。叶子节点直接从缓存的两个累加器执行 `512→32→1`，不再扫描棋盘
+走法时精确恢复。快照缓冲区在撤销后复用，避免动态尺寸导致每个节点重复分配。
+叶子节点直接从缓存的两个累加器执行配置的后半部分网络，不再扫描棋盘
 调用 `refresh_accumulator()`。
 
 ### 5. Python NNUE 训练端
@@ -443,8 +455,35 @@ JSON Lines，每行至少包含 FEN 和当前行棋方视角的引擎分值：
 训练使用带样本权重的 Smooth L1 损失和 AdamW。网络学习 `score / 600`，
 Huber 阈值也除以同一尺度；`score`、MAE 和诊断分位数仍用引擎分值表示。
 检查点记录模型、优化器、轮次、评分尺度/视角版本、真实分区指纹及配置。
-导出时仅将末层权重和偏置乘回尺度，C++ 无需再次缩放，权重仍使用 `XQNNUEF1`。
+导出时仅将末层权重和偏置乘回尺度，C++ 无需再次缩放。
 旧 v1 检查点按尺度 1 解释，跨尺度迁移只换算一次末层，并重置优化器动量。
+默认架构继续保存 v2 检查点，自定义架构保存 v3（包含累加器宽度及全部隐藏层尺寸）。
+旧 v1/v2 检查点和已有 `.nnue` 无需转换；恢复时严格核对参数名称和形状。
+`training.train --resume` 未指定尺寸时继承检查点；指定不同尺寸时拒绝续训，
+修改架构必须新建实验并从随机初始化训练，不能当作旧模型的无损迁移。
+
+百万数据的两种架构实验可直接复用已完成抽样，分别使用新的工作目录：
+
+```bash
+# 实验 A：只加宽隐藏层，512 → 64 → 1
+.venv/bin/python -u -m training.modelscope_competition \
+  --dataset-dir training/data/modelscope-nowcan/processed/competition-1m-v1 \
+  --work-dir training/runs/modelscope-nowcan-1m-wide64-v1 \
+  --accumulator-size 256 --hidden-sizes 64 \
+  --epochs 20 --batch-size 512 --seed 2026 --device cpu
+
+# 实验 B：只增加隐藏层，512 → 32 → 32 → 1
+.venv/bin/python -u -m training.modelscope_competition \
+  --dataset-dir training/data/modelscope-nowcan/processed/competition-1m-v1 \
+  --work-dir training/runs/modelscope-nowcan-1m-deep32x2-v1 \
+  --accumulator-size 256 --hidden-sizes 32 32 \
+  --epochs 20 --batch-size 512 --seed 2026 --device cpu
+```
+
+该流程会训练、导出、检查推理一致性并参加现有冠军门禁；通过才晋升。
+需要仅训练对照而不参与晋升时，可用 `training.modelscope_baseline`，同样支持
+两个尺寸参数。GUI 的 `--nnue` 仍传模型路径，不需额外指定结构。
+本次实现仅扩展配置能力，未启动上述百万样本训练，现有冠军保持不变。
 
 训练/验证按“源批次＋对局 ID”分组；没有可靠对局 ID 时整文件分组。
 固定测试清单绑定源文件 SHA-256，源文件缺失或改变会拒绝训练；相同局面及水平镜像
@@ -452,8 +491,9 @@ Huber 阈值也除以同一尺度；`score`、MAE 和诊断分位数仍用引擎
 评估验证集选中的最佳检查点一次。
 
 每轮诊断写入 `metrics.jsonl`，配置写入 `config.json`，最终指标写入 `report.json`：
-评分/赛果/总损失、引擎单位 MAE、预测及标签分位数、两层激活上下界饱和率，
+评分/赛果/总损失、引擎单位 MAE、预测及标签分位数、累加器和隐藏层激活上下界饱和率，
 以及开中残局误差。未知赛果保持未知，不计入赛果监督。
+多隐藏层的隐藏激活饱和率按全部隐藏神经元汇总，不是单独某一层的比例。
 
 `verify_cpp.py` 会临时导出模型，针对相同 FEN 分别执行 PyTorch 和 C++ 原始
 float32 前向传播，然后检查误差是否在容差内；默认绝对容差 `1e-3` 加相对容差

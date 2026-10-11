@@ -17,17 +17,25 @@ constexpr std::size_t kNnueAccumulatorSize = 256;
 constexpr std::size_t kNnueConcatenatedSize = kNnueAccumulatorSize * 2;
 constexpr std::size_t kNnueHiddenSize = 32;
 constexpr int kNnueEvaluationLimit = 28000;
+constexpr std::size_t kNnueMaxLayerWidth = 2048;
+constexpr std::size_t kNnueMaxHiddenLayers = 8;
 
-using NnueAccumulator = std::array<float, kNnueAccumulatorSize>;
+using NnueAccumulator = std::vector<float>;
 
-/// @brief 保存并执行第一版 HalfKA float32 NNUE 网络。
+/// @brief 保存并执行可配置的 HalfKA float32 NNUE 网络，兼容 F1/F2。
 ///
-/// 网络结构固定为 11340→256（双方共享特征变换）→拼接 512→32→1。
-/// 两个隐藏层均使用范围为 [0, 1] 的 ClippedReLU，最终输出直接使用引擎分值单位。
+/// 默认 11340→256×2→32→1；特征变换及所有隐藏层使用 ClippedReLU。
 class NnueNetwork {
 public:
     /// @brief 创建全部权重和偏置均为零的网络。
-    NnueNetwork();
+    /// @param accumulator_size 共享特征变换宽度，默认 256。
+    /// @param hidden_sizes 按计算顺序排列的隐藏层宽度，默认单层 32。
+    explicit NnueNetwork(std::size_t accumulator_size = kNnueAccumulatorSize,
+                         std::vector<std::size_t> hidden_sizes = {kNnueHiddenSize});
+
+    /// @brief 查询当前网络的累加器宽度及各隐藏层宽度。
+    [[nodiscard]] std::size_t accumulator_size() const { return feature_biases_.size(); }
+    [[nodiscard]] const std::vector<std::size_t>& hidden_sizes() const { return hidden_sizes_; }
 
     /// @brief 从版本化二进制文件加载 NNUE 权重。
     /// @param path 权重文件路径。
@@ -43,7 +51,7 @@ public:
     /// @brief 从局面完整计算指定视角的第一层累加器。
     /// @param position 要评估的有效局面。
     /// @param perspective 累加器的观察方。
-    /// @return 特征变换偏置加上全部激活 HalfKA 特征权重的 256 维结果。
+    /// @return 特征变换偏置加上全部激活特征权重，宽度由当前网络配置决定。
     [[nodiscard]] NnueAccumulator refresh_accumulator(
         const Position& position, Color perspective) const;
 
@@ -102,35 +110,36 @@ public:
     [[nodiscard]] std::span<const float> feature_weights() const;
 
     /// @brief 获取可修改的特征变换偏置。
-    /// @return 256 个累加器神经元的偏置。
+    /// @return 当前配置宽度的累加器偏置。
     [[nodiscard]] std::span<float> feature_biases();
 
     /// @brief 获取只读特征变换偏置。
-    /// @return 256 个累加器神经元的偏置。
+    /// @return 当前配置宽度的累加器偏置。
     [[nodiscard]] std::span<const float> feature_biases() const;
 
     /// @brief 获取可修改的隐藏层权重。
     /// @return 按 `[hidden_neuron][concatenated_input]` 排列的连续数组。
-    [[nodiscard]] std::span<float> hidden_weights();
+    /// @param layer 隐藏层序号，从 0 开始；省略时兼容原单层接口。
+    [[nodiscard]] std::span<float> hidden_weights(std::size_t layer = 0);
 
     /// @brief 获取只读隐藏层权重。
     /// @return 按 `[hidden_neuron][concatenated_input]` 排列的连续数组。
-    [[nodiscard]] std::span<const float> hidden_weights() const;
+    [[nodiscard]] std::span<const float> hidden_weights(std::size_t layer = 0) const;
 
     /// @brief 获取可修改的隐藏层偏置。
-    /// @return 32 个隐藏神经元的偏置。
-    [[nodiscard]] std::span<float> hidden_biases();
+    /// @return 指定隐藏层的神经元偏置。
+    [[nodiscard]] std::span<float> hidden_biases(std::size_t layer = 0);
 
     /// @brief 获取只读隐藏层偏置。
-    /// @return 32 个隐藏神经元的偏置。
-    [[nodiscard]] std::span<const float> hidden_biases() const;
+    /// @return 指定隐藏层的神经元偏置。
+    [[nodiscard]] std::span<const float> hidden_biases(std::size_t layer = 0) const;
 
     /// @brief 获取可修改的输出层权重。
-    /// @return 与 32 个隐藏神经元对应的权重。
+    /// @return 与最后一个隐藏层神经元对应的权重。
     [[nodiscard]] std::span<float> output_weights();
 
     /// @brief 获取只读输出层权重。
-    /// @return 与 32 个隐藏神经元对应的权重。
+    /// @return 与最后一个隐藏层神经元对应的权重。
     [[nodiscard]] std::span<const float> output_weights() const;
 
     /// @brief 获取可修改的输出层偏置。
@@ -144,9 +153,10 @@ public:
 private:
     std::vector<float> feature_weights_;
     NnueAccumulator feature_biases_{};
-    std::array<float, kNnueHiddenSize * kNnueConcatenatedSize> hidden_weights_{};
-    std::array<float, kNnueHiddenSize> hidden_biases_{};
-    std::array<float, kNnueHiddenSize> output_weights_{};
+    std::vector<std::size_t> hidden_sizes_;
+    std::vector<std::vector<float>> hidden_weights_;
+    std::vector<std::vector<float>> hidden_biases_;
+    std::vector<float> output_weights_;
     float output_bias_{0.0F};
 
     /// @brief 检查全部权重和偏置是否为有限浮点数。
@@ -190,7 +200,7 @@ public:
 
     /// @brief 查询当前保存的可撤销累加器层数。
     /// @return 尚未 `pop_move` 的增量走子数量。
-    [[nodiscard]] std::size_t stack_size() const { return stack_.size(); }
+    [[nodiscard]] std::size_t stack_size() const { return stack_depth_; }
 
 private:
     struct Snapshot {
@@ -202,6 +212,8 @@ private:
     std::array<NnueAccumulator, 2> accumulators_{};
     std::uint64_t position_hash_{0};
     std::vector<Snapshot> stack_;
+    // 撤销后保留快照缓冲区容量，避免每个搜索节点分配动态累加器。
+    std::size_t stack_depth_{0};
 };
 
 /// @brief 通过统一 Evaluator 接口提供 HalfKA NNUE 推理及搜索状态。

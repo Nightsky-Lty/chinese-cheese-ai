@@ -1,4 +1,4 @@
-"""用固定 nowcan 抽样训练原架构基线，记录日志、续训并导出，不晋升冠军。"""
+"""用固定 nowcan 抽样训练可配置架构基线，记录日志、续训并导出，不晋升冠军。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 
 from .checkpoint import load_checkpoint
 from .diagnostics import write_json
-from .model import ARCHITECTURE_NAME
+from .model import NetworkConfig
 from .partition import file_fingerprint
 from .pikafish_pipeline import run_stage
 from .run_lock import run_lock
@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main(args: argparse.Namespace) -> None:
-    """训练原 HalfKA 结构；同目录重跑时严格验证样本和配置是否一致。"""
+    """训练指定 HalfKA 结构；同目录重跑时严格验证样本和配置是否一致。"""
 
     dataset = args.dataset_dir.resolve()
     directory = args.work_dir.resolve()
@@ -38,7 +38,8 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("sampling is not complete")
     if file_fingerprint(train) != report["train_sha256"] or file_fingerprint(validation) != report["validation_sha256"]:
         raise ValueError("sampled data changed after preparation")
-    plan = {"format": "nowcan-baseline-plan-v1", "architecture": ARCHITECTURE_NAME,
+    network = NetworkConfig(args.accumulator_size, tuple(args.hidden_sizes))
+    plan = {"format": "nowcan-baseline-plan-v1", "architecture": network.name,
             "train": str(train), "validation": str(validation),
             "sampling_report_sha256": file_fingerprint(dataset / "sampling-report.json"),
             "test_manifest": str(args.test_manifest.resolve()),
@@ -65,6 +66,8 @@ def main(args: argparse.Namespace) -> None:
                    "--skip-fixed-test", "--output-dir", str(directory), "--epochs", str(args.epochs),
                    "--batch-size", str(args.batch_size), "--device", args.device,
                    "--score-scale", "600", "--outcome-weight", "0", "--seed", str(args.seed)]
+        command.extend(["--accumulator-size", str(network.accumulator_size),
+                        "--hidden-sizes", *map(str, network.hidden_sizes)])
         latest = directory / "latest.pt"
         if latest.exists():
             epoch = int(load_checkpoint(latest, "cpu")["epoch"])
@@ -88,7 +91,7 @@ def main(args: argparse.Namespace) -> None:
     state.update(status="trained_not_promoted", model=str(directory / "best.nnue"),
                  model_sha256=file_fingerprint(directory / "best.nnue"), champion_changed=False)
     write_json(state_path, state)
-    print(f"complete: {directory / 'best.nnue'}; architecture unchanged; champion unchanged", flush=True)
+    print(f"complete: {directory / 'best.nnue'}; architecture={network.name}; champion unchanged", flush=True)
 
 
 if __name__ == "__main__":
@@ -101,6 +104,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--accumulator-size", type=int, default=256)
+    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[32])
     arguments = parser.parse_args()
     if arguments.epochs <= 0 or arguments.batch_size <= 0:
         parser.error("epochs and batch size must be positive")

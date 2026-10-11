@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from .checkpoint import load_model
+from .checkpoint import load_model, architecture_metadata
 from .dataset import TrainingSample, collate_samples
 from .export_nnue import export_model
 from .halfka import encode_fen
@@ -86,7 +86,7 @@ def cpp_score(engine: Path, model_path: Path, fen: str) -> float:
 
     参数:
         engine: 已构建的 ``xiangqi_cli`` 路径。
-        model_path: ``XQNNUEF1`` 模型路径。
+        model_path: ``XQNNUEF1`` 或 ``XQNNUEF2`` 模型路径。
         fen: 包含行棋方的中国象棋 FEN。
 
     返回:
@@ -186,6 +186,7 @@ def main() -> None:
             "model": {
                 "checkpoint": str(args.checkpoint),
                 "checkpoint_sha256": checkpoint_hash,
+                "architecture": architecture_metadata(model.config),
                 "score_scale_engine_units_per_raw_output": model.score_scale,
             },
             "engine": str(args.engine),

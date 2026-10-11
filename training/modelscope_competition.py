@@ -1,4 +1,4 @@
-"""扩充 nowcan 数据、训练原架构候选，并通过完整门禁竞争冠军。
+"""扩充 nowcan 数据、训练可配置架构候选，并通过完整门禁竞争冠军。
 
 所有阶段有独立日志和状态；自动晋升须通过门禁，不依赖已清理的历史实验目录。
 """
@@ -18,7 +18,7 @@ from .baseline import validation_gate
 from .checkpoint import load_checkpoint
 from .diagnostics import write_json
 from .iterate import atomic_copy, next_arena_report_path
-from .model import ARCHITECTURE_NAME
+from .model import NetworkConfig
 from .partition import file_fingerprint, load_test_manifest
 from .pikafish_pipeline import run_stage
 from .run_lock import run_lock
@@ -80,7 +80,7 @@ def execute_stage(command: list[str], name: str, directory: Path, state: dict[st
 
 
 def run(args: argparse.Namespace) -> None:
-    """百万局面实验：固定验证、独立同单位测试、原架构训练和冠军门禁。"""
+    """百万局面实验：固定验证、独立测试、可配置架构训练和冠军门禁。"""
 
     directory = args.work_dir.resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -96,7 +96,8 @@ def run(args: argparse.Namespace) -> None:
                 verify_artifact(record)
             print(f"already complete: {completed['status']}; report: {state_path}", flush=True)
             return
-    config = {"architecture": ARCHITECTURE_NAME, "train_count": args.train_count,
+    network = NetworkConfig(args.accumulator_size, tuple(args.hidden_sizes))
+    config = {"architecture": network.name, "train_count": args.train_count,
               "validation_count": 10000, "test_count": 10000, "epochs": args.epochs,
               "batch_size": args.batch_size, "device": args.device, "seed": args.seed,
               "initialization": "random", "score_scale": 600, "outcome_weight": 0,
@@ -173,6 +174,8 @@ def run(args: argparse.Namespace) -> None:
              "--test-manifest", str(dataset / "test-manifest.json"), "--output-dir", str(directory),
              "--epochs", str(args.epochs), "--batch-size", str(args.batch_size), "--device", args.device,
              "--score-scale", "600", "--outcome-weight", "0", "--seed", str(args.seed)]
+    train.extend(["--accumulator-size", str(network.accumulator_size),
+                  "--hidden-sizes", *map(str, network.hidden_sizes)])
     latest = directory / "latest.pt"
     if latest.exists() and not state["stages"].get("train", {}).get("complete"):
         train.extend(["--resume", str(latest)])
@@ -257,6 +260,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--accumulator-size", type=int, default=256)
+    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[32])
     parser.add_argument("--openings", type=Path, default=DEFAULT_OPENINGS)
     parser.add_argument("--time-limit-ms", type=int, default=50)
     parser.add_argument("--max-plies", type=int, default=300)

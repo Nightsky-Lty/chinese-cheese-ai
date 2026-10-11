@@ -1,4 +1,4 @@
-"""把 PyTorch 检查点导出为 C++ 可直接加载的 ``XQNNUEF1`` 格式。"""
+"""导出 C++ NNUE：默认架构保持 F1，自定义架构使用携带层尺寸的 F2。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import torch
 
 from .checkpoint import load_model
 from .halfka import FEATURE_DIMENSIONS
-from .model import ACCUMULATOR_SIZE, HIDDEN_SIZE, HalfKANetwork
+from .model import HalfKANetwork, NetworkConfig
 
 FILE_MAGIC = b"XQNNUEF1"
 FILE_VERSION = 1
@@ -63,37 +63,40 @@ def export_model(model: HalfKANetwork, destination: str | Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     model = model.to("cpu").eval()
+    config = model.config
+    legacy = config == NetworkConfig()
+    accumulator_size = config.accumulator_size
     with temporary.open("wb") as stream:
         stream.write(
             HEADER.pack(
-                FILE_MAGIC,
-                FILE_VERSION,
+                FILE_MAGIC if legacy else b"XQNNUEF2",
+                FILE_VERSION if legacy else 2,
                 FEATURE_DIMENSIONS,
-                ACCUMULATOR_SIZE,
-                HIDDEN_SIZE,
+                accumulator_size,
+                config.hidden_sizes[0] if legacy else len(config.hidden_sizes),
             )
         )
+        if not legacy:
+            stream.write(struct.pack(f"<{len(config.hidden_sizes)}I", *config.hidden_sizes))
         # 以下顺序与 NnueNetwork::load() 完全一致，不能随意调整。
-        stream.write(_float32_bytes(model.feature_bias, (ACCUMULATOR_SIZE,)))
+        stream.write(_float32_bytes(model.feature_bias, (accumulator_size,)))
         stream.write(
             _float32_bytes(
                 model.feature_weights,
-                (FEATURE_DIMENSIONS, ACCUMULATOR_SIZE),
+                (FEATURE_DIMENSIONS, accumulator_size),
             )
         )
-        stream.write(_float32_bytes(model.hidden.bias, (HIDDEN_SIZE,)))
-        stream.write(
-            _float32_bytes(
-                model.hidden.weight,
-                (HIDDEN_SIZE, ACCUMULATOR_SIZE * 2),
-            )
-        )
+        input_size = accumulator_size * 2
+        for layer, width in zip(model.dense_layers(), config.hidden_sizes):
+            stream.write(_float32_bytes(layer.bias, (width,)))
+            stream.write(_float32_bytes(layer.weight, (width, input_size)))
+            input_size = width
         # C++ 推理只认识引擎分数。仅末层线性参数需要从训练单位还原；
         # 旧检查点的 score_scale=1，不会发生重复缩放。
         stream.write(_float32_bytes(model.output.bias * model.score_scale, (1,)))
         stream.write(
             _float32_bytes(
-                model.output.weight * model.score_scale, (1, HIDDEN_SIZE)
+                model.output.weight * model.score_scale, (1, config.hidden_sizes[-1])
             )
         )
         stream.flush()

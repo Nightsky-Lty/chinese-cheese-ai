@@ -16,13 +16,16 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 
 from .checkpoint import (
     checkpoint_score_scale,
+    checkpoint_network_config,
+    architecture_metadata,
+    model_from_checkpoint,
     load_checkpoint,
     migrate_output_score_scale,
     save_checkpoint,
 )
 from .dataset import JsonlPositionDataset, TrainingSample, collate_samples
 from .diagnostics import EpochMetrics, append_jsonl, write_json
-from .model import DEFAULT_SCORE_SCALE, HalfKANetwork, NnueBatch
+from .model import DEFAULT_SCORE_SCALE, HalfKANetwork, NnueBatch, NetworkConfig
 from .partition import (
     DEFAULT_QUARANTINE_MANIFEST, DEFAULT_TEST_MANIFEST,
     file_fingerprint, load_quarantine_manifest, load_test_manifest,
@@ -478,6 +481,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=Path("training/runs/default"))
     parser.add_argument("--resume", type=Path, help="resume from a .pt checkpoint")
+    parser.add_argument("--accumulator-size", type=int, default=None,
+                        help="shared feature-transform width; default 256 or resume checkpoint")
+    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=None,
+                        help="hidden layer widths in order, e.g. 32 32; default 32 or resume checkpoint")
     parser.add_argument(
         "--reset-best",
         action="store_true",
@@ -534,6 +541,17 @@ def main() -> None:
     """执行数据加载、可选续训、逐轮训练以及最佳/最新检查点保存。"""
 
     args = parse_args()
+    # 续训未指定尺寸时继承检查点；明确指定却不同则拒绝，不能隐式迁移架构。
+    initial_checkpoint = load_checkpoint(args.resume, "cpu") if args.resume else None
+    inherited = checkpoint_network_config(initial_checkpoint) if initial_checkpoint else NetworkConfig()
+    network_config = NetworkConfig(
+        inherited.accumulator_size if args.accumulator_size is None else args.accumulator_size,
+        inherited.hidden_sizes if args.hidden_sizes is None else tuple(args.hidden_sizes),
+    )
+    if initial_checkpoint is not None and network_config != inherited:
+        raise ValueError("resume architecture differs; start a new experiment without --resume")
+    args.accumulator_size = network_config.accumulator_size
+    args.hidden_sizes = list(network_config.hidden_sizes)
     if args.epochs < 0 or (args.epochs == 0 and not args.resume) or args.batch_size <= 0:
         raise ValueError("epochs must be positive (or 0 with resume); batch size must be positive")
     if not 0.0 <= args.validation_fraction < 1.0:
@@ -629,6 +647,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_config = {
         "format": "xiangqi-nnue-training-config-v1",
+        "architecture": architecture_metadata(network_config),
         "training_args": _training_args(args),
         "score_units": {
             "score_scale_engine_units_per_raw_output": args.score_scale,
@@ -647,7 +666,9 @@ def main() -> None:
         "device": str(device),
         "torch_version": torch.__version__,
     }
-    model = HalfKANetwork(args.score_scale).to(device)
+    model = HalfKANetwork(args.score_scale, accumulator_size=network_config.accumulator_size,
+                          hidden_sizes=network_config.hidden_sizes).to(device)
+    run_config["parameter_count"] = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -657,7 +678,8 @@ def main() -> None:
     resumed_checkpoint: dict[str, Any] | None = None
     reset_optimizer_reason: str | None = None
     if args.resume:
-        checkpoint = load_checkpoint(args.resume, device)
+        checkpoint = initial_checkpoint
+        assert checkpoint is not None
         resumed_checkpoint = checkpoint
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         previous_scale = checkpoint_score_scale(checkpoint)
@@ -689,6 +711,7 @@ def main() -> None:
 
     write_json(args.output_dir / "config.json", run_config)
     print(
+        f"architecture={network_config.name} parameters={run_config['parameter_count']} "
         f"device={device} samples={len(dataset)} "
         f"train={len(train_loader.dataset)} "
         f"validation={len(validation_loader.dataset) if validation_loader else 0} "
@@ -706,13 +729,11 @@ def main() -> None:
         source_best_path = args.resume.parent / "best.pt"
         if source_best_path.is_file() and not args.reset_best:
             possible_best = load_checkpoint(source_best_path, device)
-            if possible_best.get("split_metadata") == current_split:
+            if (possible_best.get("split_metadata") == current_split
+                    and checkpoint_network_config(possible_best) == network_config):
                 baseline_source = possible_best
         baseline_scale = checkpoint_score_scale(baseline_source)
-        baseline_model = HalfKANetwork(baseline_scale).to(device)
-        baseline_model.load_state_dict(
-            baseline_source["model_state_dict"], strict=True
-        )
+        baseline_model = model_from_checkpoint(baseline_source, device)
         if baseline_scale != args.score_scale:
             migrate_output_score_scale(
                 baseline_model, baseline_scale, args.score_scale
@@ -744,6 +765,7 @@ def main() -> None:
                 "training_args": _training_args(args),
             },
             score_scale=args.score_scale,
+            network_config=network_config,
         )
         append_jsonl(
             metrics_path,
@@ -805,7 +827,8 @@ def main() -> None:
             "training_args": _training_args(args),
         }
         # latest 每轮覆盖，best 只在验证损失改善时更新。
-        save_checkpoint(args.output_dir / "latest.pt", payload, score_scale=args.score_scale)
+        save_checkpoint(args.output_dir / "latest.pt", payload, score_scale=args.score_scale,
+                        network_config=network_config)
         if improved:
             save_checkpoint(
                 args.output_dir / "best.pt",
@@ -819,6 +842,7 @@ def main() -> None:
                     "training_args": _training_args(args),
                 },
                 score_scale=args.score_scale,
+                network_config=network_config,
             )
         append_jsonl(
             metrics_path,
@@ -839,8 +863,7 @@ def main() -> None:
     fixed_test_metrics: dict[str, Any] | None = None
     if test_loader is not None:
         best_checkpoint = load_checkpoint(args.output_dir / "best.pt", device)
-        best_model = HalfKANetwork(checkpoint_score_scale(best_checkpoint)).to(device)
-        best_model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
+        best_model = model_from_checkpoint(best_checkpoint, device)
         fixed_test_metrics = run_epoch(
             best_model, test_loader, device, args.huber_beta,
             args.outcome_weight, args.outcome_scale, None, args.gradient_clip,

@@ -16,6 +16,7 @@ namespace {
 
 constexpr std::array<char, 8> kFileMagic{'X', 'Q', 'N', 'N', 'U', 'E', 'F', '1'};
 constexpr std::uint32_t kFileVersion = 1;
+constexpr std::array<char, 8> kConfigurableMagic{'X', 'Q', 'N', 'N', 'U', 'E', 'F', '2'};
 
 /// @brief 对 NNUE 隐藏层值应用范围为 [0, 1] 的 ClippedReLU。
 /// @param value 激活前的浮点值。
@@ -105,8 +106,26 @@ bool all_finite(std::span<const float> values) {
 
 }  // namespace
 
-NnueNetwork::NnueNetwork()
-    : feature_weights_(kHalfKAFeatureDimensions * kNnueAccumulatorSize, 0.0F) {}
+NnueNetwork::NnueNetwork(std::size_t accumulator_size,
+                         std::vector<std::size_t> hidden_sizes)
+    : hidden_sizes_(std::move(hidden_sizes)) {
+    if (accumulator_size == 0 || accumulator_size > kNnueMaxLayerWidth ||
+        hidden_sizes_.empty() || hidden_sizes_.size() > kNnueMaxHiddenLayers ||
+        std::any_of(hidden_sizes_.begin(), hidden_sizes_.end(), [](std::size_t size) {
+            return size == 0 || size > kNnueMaxLayerWidth;
+        })) {
+        throw std::invalid_argument("NNUE layer widths must be 1..2048, hidden count 1..8");
+    }
+    feature_weights_.resize(kHalfKAFeatureDimensions * accumulator_size, 0.0F);
+    feature_biases_.resize(accumulator_size, 0.0F);
+    std::size_t input_size = accumulator_size * 2;
+    for (std::size_t size : hidden_sizes_) {
+        hidden_weights_.emplace_back(size * input_size, 0.0F);
+        hidden_biases_.emplace_back(size, 0.0F);
+        input_size = size;
+    }
+    output_weights_.resize(hidden_sizes_.back(), 0.0F);
+}
 
 NnueNetwork NnueNetwork::load(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
@@ -116,26 +135,59 @@ NnueNetwork NnueNetwork::load(const std::filesystem::path& path) {
 
     std::array<char, kFileMagic.size()> magic{};
     stream.read(magic.data(), static_cast<std::streamsize>(magic.size()));
-    if (!stream || magic != kFileMagic) {
+    if (!stream || (magic != kFileMagic && magic != kConfigurableMagic)) {
         throw std::runtime_error("invalid NNUE file magic");
     }
 
     const std::uint32_t version = read_u32(stream);
     const std::uint32_t feature_dimensions = read_u32(stream);
     const std::uint32_t accumulator_size = read_u32(stream);
-    const std::uint32_t hidden_size = read_u32(stream);
-    if (version != kFileVersion ||
+    const std::uint32_t hidden_field = read_u32(stream);
+    const bool legacy = magic == kFileMagic;
+    if (version != (legacy ? kFileVersion : 2U) ||
         feature_dimensions != static_cast<std::uint32_t>(kHalfKAFeatureDimensions) ||
-        accumulator_size != static_cast<std::uint32_t>(kNnueAccumulatorSize) ||
-        hidden_size != static_cast<std::uint32_t>(kNnueHiddenSize)) {
+        (legacy && (accumulator_size != kNnueAccumulatorSize || hidden_field != kNnueHiddenSize)) ||
+        (!legacy && (hidden_field == 0 || hidden_field > kNnueMaxHiddenLayers))) {
         throw std::runtime_error("incompatible NNUE file version or dimensions");
     }
 
-    NnueNetwork network;
+    std::vector<std::size_t> hidden_sizes;
+    if (legacy) {
+        hidden_sizes.push_back(hidden_field);
+    } else {
+        for (std::uint32_t layer = 0; layer < hidden_field; ++layer) {
+            hidden_sizes.push_back(read_u32(stream));
+        }
+    }
+    // 构造前验证尺寸，并核对完整文件长度，拒绝损坏头部引起的无意义大分配。
+    if (accumulator_size == 0 || accumulator_size > kNnueMaxLayerWidth ||
+        std::any_of(hidden_sizes.begin(), hidden_sizes.end(), [](std::size_t size) {
+            return size == 0 || size > kNnueMaxLayerWidth;
+        })) {
+        throw std::runtime_error("invalid NNUE layer dimensions");
+    }
+    std::uint64_t count = (kHalfKAFeatureDimensions + 1) * accumulator_size;
+    std::size_t input_size = accumulator_size * 2;
+    for (std::size_t size : hidden_sizes) {
+        count += size * (input_size + 1);
+        input_size = size;
+    }
+    count += input_size + 1;
+    const auto data_start = stream.tellg();
+    stream.seekg(0, std::ios::end);
+    const auto data_end = stream.tellg();
+    if (data_start < 0 || data_end < data_start ||
+        static_cast<std::uint64_t>(data_end - data_start) != count * sizeof(float)) {
+        throw std::runtime_error("NNUE file size does not match layer dimensions");
+    }
+    stream.seekg(data_start);
+    NnueNetwork network(accumulator_size, std::move(hidden_sizes));
     read_values(stream, network.feature_biases());
     read_values(stream, network.feature_weights());
-    read_values(stream, network.hidden_biases());
-    read_values(stream, network.hidden_weights());
+    for (std::size_t layer = 0; layer < network.hidden_sizes().size(); ++layer) {
+        read_values(stream, network.hidden_biases(layer));
+        read_values(stream, network.hidden_weights(layer));
+    }
     network.output_bias() = read_f32(stream);
     read_values(stream, network.output_weights());
 
@@ -157,18 +209,28 @@ void NnueNetwork::save(const std::filesystem::path& path) const {
         throw std::runtime_error("cannot open NNUE file for writing: " + path.string());
     }
 
-    stream.write(kFileMagic.data(), static_cast<std::streamsize>(kFileMagic.size()));
+    const bool legacy = accumulator_size() == kNnueAccumulatorSize &&
+                        hidden_sizes_ == std::vector<std::size_t>{kNnueHiddenSize};
+    const auto& magic = legacy ? kFileMagic : kConfigurableMagic;
+    stream.write(magic.data(), static_cast<std::streamsize>(magic.size()));
     if (!stream) {
         throw std::runtime_error("failed to write NNUE file header");
     }
-    write_u32(stream, kFileVersion);
+    write_u32(stream, legacy ? kFileVersion : 2U);
     write_u32(stream, static_cast<std::uint32_t>(kHalfKAFeatureDimensions));
-    write_u32(stream, static_cast<std::uint32_t>(kNnueAccumulatorSize));
-    write_u32(stream, static_cast<std::uint32_t>(kNnueHiddenSize));
+    write_u32(stream, static_cast<std::uint32_t>(accumulator_size()));
+    write_u32(stream, static_cast<std::uint32_t>(legacy ? kNnueHiddenSize : hidden_sizes_.size()));
+    if (!legacy) {
+        for (std::size_t size : hidden_sizes_) {
+            write_u32(stream, static_cast<std::uint32_t>(size));
+        }
+    }
     write_values(stream, feature_biases());
     write_values(stream, feature_weights());
-    write_values(stream, hidden_biases());
-    write_values(stream, hidden_weights());
+    for (std::size_t layer = 0; layer < hidden_sizes_.size(); ++layer) {
+        write_values(stream, hidden_biases(layer));
+        write_values(stream, hidden_weights(layer));
+    }
     write_f32(stream, output_bias_);
     write_values(stream, output_weights());
 }
@@ -189,8 +251,11 @@ void NnueNetwork::add_feature(
     if (feature >= kHalfKAFeatureDimensions) {
         throw std::out_of_range("NNUE feature index outside network input");
     }
-    const std::size_t offset = feature * kNnueAccumulatorSize;
-    for (std::size_t neuron = 0; neuron < kNnueAccumulatorSize; ++neuron) {
+    if (accumulator.size() != accumulator_size()) {
+        throw std::invalid_argument("NNUE accumulator width does not match network");
+    }
+    const std::size_t offset = feature * accumulator_size();
+    for (std::size_t neuron = 0; neuron < accumulator_size(); ++neuron) {
         accumulator[neuron] += feature_weights_[offset + neuron];
     }
 }
@@ -200,8 +265,11 @@ void NnueNetwork::remove_feature(
     if (feature >= kHalfKAFeatureDimensions) {
         throw std::out_of_range("NNUE feature index outside network input");
     }
-    const std::size_t offset = feature * kNnueAccumulatorSize;
-    for (std::size_t neuron = 0; neuron < kNnueAccumulatorSize; ++neuron) {
+    if (accumulator.size() != accumulator_size()) {
+        throw std::invalid_argument("NNUE accumulator width does not match network");
+    }
+    const std::size_t offset = feature * accumulator_size();
+    for (std::size_t neuron = 0; neuron < accumulator_size(); ++neuron) {
         accumulator[neuron] -= feature_weights_[offset + neuron];
     }
 }
@@ -221,26 +289,36 @@ float NnueNetwork::forward_from_accumulators(
     const NnueAccumulator& opponent =
         perspective == Color::Red ? black_accumulator : red_accumulator;
 
-    std::array<float, kNnueConcatenatedSize> input{};
-    for (std::size_t neuron = 0; neuron < kNnueAccumulatorSize; ++neuron) {
+    if (own.size() != accumulator_size() || opponent.size() != accumulator_size()) {
+        throw std::invalid_argument("NNUE accumulator width does not match network");
+    }
+    // 只写实际使用的维度，使用栈上工作区，避免每个评估节点堆分配。
+    std::array<float, kNnueMaxLayerWidth * 2> first;
+    std::array<float, kNnueMaxLayerWidth * 2> second;
+    float* input = first.data();
+    float* hidden = second.data();
+    for (std::size_t neuron = 0; neuron < accumulator_size(); ++neuron) {
         input[neuron] = clipped_relu(own[neuron]);
-        input[kNnueAccumulatorSize + neuron] = clipped_relu(opponent[neuron]);
+        input[accumulator_size() + neuron] = clipped_relu(opponent[neuron]);
     }
 
-    std::array<float, kNnueHiddenSize> hidden{};
-    for (std::size_t neuron = 0; neuron < kNnueHiddenSize; ++neuron) {
-        float sum = hidden_biases_[neuron];
-        const std::size_t offset = neuron * kNnueConcatenatedSize;
-        for (std::size_t input_index = 0;
-             input_index < kNnueConcatenatedSize; ++input_index) {
-            sum += hidden_weights_[offset + input_index] * input[input_index];
+    std::size_t input_size = accumulator_size() * 2;
+    for (std::size_t layer = 0; layer < hidden_sizes_.size(); ++layer) {
+        for (std::size_t neuron = 0; neuron < hidden_sizes_[layer]; ++neuron) {
+            float sum = hidden_biases_[layer][neuron];
+            const std::size_t offset = neuron * input_size;
+            for (std::size_t index = 0; index < input_size; ++index) {
+                sum += hidden_weights_[layer][offset + index] * input[index];
+            }
+            hidden[neuron] = clipped_relu(sum);
         }
-        hidden[neuron] = clipped_relu(sum);
+        input_size = hidden_sizes_[layer];
+        std::swap(input, hidden);
     }
 
     float output = output_bias_;
-    for (std::size_t neuron = 0; neuron < kNnueHiddenSize; ++neuron) {
-        output += output_weights_[neuron] * hidden[neuron];
+    for (std::size_t neuron = 0; neuron < input_size; ++neuron) {
+        output += output_weights_[neuron] * input[neuron];
     }
     return output;
 }
@@ -283,20 +361,20 @@ std::span<const float> NnueNetwork::feature_biases() const {
     return feature_biases_;
 }
 
-std::span<float> NnueNetwork::hidden_weights() {
-    return hidden_weights_;
+std::span<float> NnueNetwork::hidden_weights(std::size_t layer) {
+    return hidden_weights_.at(layer);
 }
 
-std::span<const float> NnueNetwork::hidden_weights() const {
-    return hidden_weights_;
+std::span<const float> NnueNetwork::hidden_weights(std::size_t layer) const {
+    return hidden_weights_.at(layer);
 }
 
-std::span<float> NnueNetwork::hidden_biases() {
-    return hidden_biases_;
+std::span<float> NnueNetwork::hidden_biases(std::size_t layer) {
+    return hidden_biases_.at(layer);
 }
 
-std::span<const float> NnueNetwork::hidden_biases() const {
-    return hidden_biases_;
+std::span<const float> NnueNetwork::hidden_biases(std::size_t layer) const {
+    return hidden_biases_.at(layer);
 }
 
 std::span<float> NnueNetwork::output_weights() {
@@ -318,11 +396,14 @@ float NnueNetwork::output_bias() const {
 void NnueNetwork::validate_finite() const {
     if (!all_finite(feature_weights()) ||
         !all_finite(feature_biases()) ||
-        !all_finite(hidden_weights()) ||
-        !all_finite(hidden_biases()) ||
         !all_finite(output_weights()) ||
         !std::isfinite(output_bias_)) {
         throw std::runtime_error("NNUE weights contain NaN or infinity");
+    }
+    for (std::size_t layer = 0; layer < hidden_sizes_.size(); ++layer) {
+        if (!all_finite(hidden_weights(layer)) || !all_finite(hidden_biases(layer))) {
+            throw std::runtime_error("NNUE hidden weights contain NaN or infinity");
+        }
     }
 }
 
@@ -343,7 +424,12 @@ void NnueEvaluationState::push_move(
         throw std::invalid_argument("invalid move metadata for NNUE accumulator update");
     }
 
-    stack_.push_back(Snapshot{accumulators_, position_hash_});
+    if (stack_depth_ == stack_.size()) {
+        stack_.emplace_back();
+    }
+    stack_[stack_depth_].accumulators = accumulators_;
+    stack_[stack_depth_].position_hash = position_hash_;
+    ++stack_depth_;
     try {
         const Color mover = piece_color(moved);
         for (Color perspective : {Color::Red, Color::Black}) {
@@ -372,20 +458,20 @@ void NnueEvaluationState::push_move(
         }
         position_hash_ = position_after.hash();
     } catch (...) {
-        accumulators_ = stack_.back().accumulators;
-        position_hash_ = stack_.back().position_hash;
-        stack_.pop_back();
+        --stack_depth_;
+        accumulators_ = stack_[stack_depth_].accumulators;
+        position_hash_ = stack_[stack_depth_].position_hash;
         throw;
     }
 }
 
 void NnueEvaluationState::pop_move() {
-    if (stack_.empty()) {
+    if (stack_depth_ == 0) {
         throw std::logic_error("cannot pop the root NNUE accumulator state");
     }
-    accumulators_ = stack_.back().accumulators;
-    position_hash_ = stack_.back().position_hash;
-    stack_.pop_back();
+    --stack_depth_;
+    accumulators_ = stack_[stack_depth_].accumulators;
+    position_hash_ = stack_[stack_depth_].position_hash;
 }
 
 int NnueEvaluationState::evaluate_for(
