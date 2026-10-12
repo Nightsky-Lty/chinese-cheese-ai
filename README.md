@@ -523,7 +523,7 @@ tail -f training/runs/architecture-1m-500ms-v1/queue.log
 防自动睡眠断言也已释放。日志和局数统计保留，但由于中途停止，没有生成完整
 `arena-500ms.json` 或两组汇总，不能当作完成的评测或冠军晋升证据。
 
-2026-10-11 已启动特征表达层扩展实验 `modelscope-nowcan-1m-acc384-v1`：
+2026-10-11 已完成特征表达层扩展实验 `modelscope-nowcan-1m-acc384-v1` 的训练与导出：
 结构为 `11340→384×2→32→1`，约 438 万参数；仅将每视角累加器从 256 扩大到
 384，隐藏层保持单层 32。复用同一份 1m 训练 / 10k 独立验证 / 10k 固定测试数据，
 从随机初始化训练 20 轮，batch 512、CPU 4 线程、AdamW 学习率 0.001、
@@ -551,6 +551,34 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 .venv/bin/python -u -m training.train \
 
 ```bash
 tail -f training/runs/modelscope-nowcan-1m-acc384-v1/run.log
+```
+
+该模型已完成 20 轮训练，验证最优检查点为第 12 轮，验证 loss 为 0.575463，
+固定测试 MAE 为 386.97（引擎分值单位）；Python/C++ 三个抽查局面全部一致。
+模型为 `training/runs/modelscope-nowcan-1m-acc384-v1/best.nnue`，冠军未更改。
+
+2026-10-12 已启动该模型对原 1m 冠军的 100ms 初步评测：共 50 局，即 25 个固定
+开局各交换红黑两局，双方每步 100ms、深度上限 64、每局最多 300 半步。
+只运行这一组对战，不混入手工评估或其他历史模型，不自动晋升冠军。对应命令：
+
+```bash
+.venv/bin/python -u -m training.arena \
+  --candidate training/runs/modelscope-nowcan-1m-acc384-v1/best.nnue \
+  --champion training/runs/modelscope-nowcan-1m-v1/best.nnue \
+  --no-hand --search-mode time --depth 64 --time-limit-ms 100 \
+  --min-games 50 --min-independent-pairs 25 --max-plies 300 --max-unfinished 5 \
+  --output training/runs/modelscope-nowcan-1m-acc384-v1/arena-100ms-50games.json
+```
+
+本次后台运行记录位于 `training/runs/arena-acc384-100ms-50-v1/`：`plan.json`
+保存命令与模型/引擎/开局哈希，`progress.json` 每完成一局更新计数，`run.log`
+保存实时结果；结束后写入上述完整竞技场报告。50 局只用于诊断，少于现有冠军门禁
+要求的 100 局 / 50 个开局配对；报告的 `passed=false` 不应单独解释为模型棋力更弱。
+比赛运行期间不要重复执行上面的命令。
+
+```bash
+tail -f training/runs/arena-acc384-100ms-50-v1/run.log
+.venv/bin/python -m json.tool training/runs/arena-acc384-100ms-50-v1/progress.json
 ```
 
 训练/验证按“源批次＋对局 ID”分组；没有可靠对局 ID 时整文件分组。
