@@ -581,6 +581,54 @@ tail -f training/runs/arena-acc384-100ms-50-v1/run.log
 .venv/bin/python -m json.tool training/runs/arena-acc384-100ms-50-v1/progress.json
 ```
 
+2026-10-12 已启动 500 万局面的默认架构数据扩展实验 `modelscope-nowcan-5m-v1`。
+本轮不修改 NNUE：使用当前 1m 冠军的 `11340→256×2→32→1` 架构，约 292 万参数，
+从随机初始化训练，以比较增加数据量而不是增加网络容量的作用。
+
+新数据输出到 `training/data/modelscope-nowcan/processed/baseline-5m-v1/`，旧数据不覆盖。
+配额仍为深度 11 中盘 250 万、深度 11 残局 125 万、深度 16 残局 125 万；
+每盘最多取 8 个局面，评分采用已审计的 `post-mover` 转换，不重新运行 Pikafish。
+独立验证复用原 1m 实验的 10k 条，固定测试也使用原来的 10k 锚点，不再生成新测试集。
+
+```bash
+.venv/bin/python -u -m training.modelscope_data prepare \
+  --audit training/data/modelscope-nowcan/processed/score-audit.json \
+  --convention post-mover --score-multiplier 1 \
+  --train-count 5000000 --validation-count 10000 \
+  --fixed-validation training/data/modelscope-nowcan/processed/competition-1m-v1/validation.jsonl \
+  --test-manifest training/data/modelscope-nowcan/processed/competition-1m-v1/test-manifest.json \
+  --test-count 0 --per-game 8 --max-score 3000 --seed 2026 \
+  --output training/data/modelscope-nowcan/processed/baseline-5m-v1
+```
+
+抽样完全完成且文件指纹通过校验后，本次后台脚本自动开始训练：20 轮、batch 512、
+CPU 4 线程、DataLoader workers 0、AdamW 学习率 0.001、weight decay 0.00001、
+评分尺度 600、Huber 阈值 100、纯评分监督，种子 2026。训练阶段对应命令：
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 .venv/bin/python -u -m training.train \
+  training/data/modelscope-nowcan/processed/baseline-5m-v1/train.jsonl \
+  --validation-dataset training/data/modelscope-nowcan/processed/baseline-5m-v1/validation.jsonl \
+  --test-manifest training/data/modelscope-nowcan/processed/competition-1m-v1/test-manifest.json \
+  --output-dir training/runs/modelscope-nowcan-5m-v1 \
+  --accumulator-size 256 --hidden-sizes 32 --epochs 20 --batch-size 512 --workers 0 \
+  --learning-rate 0.001 --weight-decay 0.00001 --score-scale 600 --huber-beta 100 \
+  --outcome-weight 0 --seed 2026 --split-seed 2026 --device cpu
+```
+
+最后自动导出 `best.nnue` 并执行 Python/C++ 原始评分抽查；不运行竞技场、不替换冠军。
+`training/runs/modelscope-nowcan-5m-v1/plan.json` 固定命令与锚点哈希，
+`pipeline-state.json` 记录当前阶段，`run.log` 汇总日志；`prepare.log` 保存分来源的
+抽样进度，`train.log` / `metrics.jsonl` 保存训练进度与逐轮指标。
+抽样按 SQLite 提交点恢复，训练按 `latest.pt` 已保存的完整轮次恢复；后台运行期间
+不要重复启动上述命令。查看日志或在停止后恢复整条流水线：
+
+```bash
+tail -f training/runs/modelscope-nowcan-5m-v1/run.log
+# 仅在先前进程已退出后恢复；运行目录中的脚本不随 Git 推送。
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 .venv/bin/python -u training/runs/modelscope-nowcan-5m-v1/run.py
+```
+
 训练/验证按“源批次＋对局 ID”分组；没有可靠对局 ID 时整文件分组。
 固定测试清单绑定源文件 SHA-256，源文件缺失或改变会拒绝训练；相同局面及水平镜像
 不会跨分区，后续回放也会剔除测试局面。固定测试集不用于选择 epoch，只在结束后
