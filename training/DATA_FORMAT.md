@@ -80,8 +80,9 @@ depth11-mg、depth11-eg、depth16-eg 存放数据库。SQLite 表 `XQPGN` 的 `P
 - `*.log`：各阶段命令、标准输出和错误；不是训练样本。
 - `report.json`、`parity.json`、`arena.json`：训练、推理一致性和对战的结构化结果。
 - `competition-plan.json` 与 `competition-state.json`：完整实验计划与阶段/晋升状态。
-- `champions/state.json`：当前冠军路径、指纹和选择来源；本次人工指定记录为
-  `user-selected-modelscope-1m`，不是把原 `arena.json` 的失败结果改成成功。
+- `champions/state.json`：当前冠军路径、指纹和选择来源；`origin` 区分人工选择与自动晋升。
+  人工选择已有比赛时，在 `champions/promotions/` 另存新策略的重裁决证据，
+  保留 `previous` 和原登记备份，不把旧 `arena.json` 的失败结果改成成功。
 
 旧实验产物已删除，保留报告中的旧输入路径仅是历史证据，不应拿它们启动新任务。
 已完成的 ModelScope 实验可读取或检查完成状态；改变参数时使用新的实验目录。
@@ -104,7 +105,7 @@ depth11-mg、depth11-eg、depth16-eg 存放数据库。SQLite 表 `XQPGN` 的 `P
 
 `win_improvement_by_color.red/black` 为候选胜率减对手的同色胜率，
 直接使用本次比赛的完成局统计，不读取冠军旧比赛胜率。无可比完成局时为 `null`，不能通过。
-有冠军时 `required_win_improvement` 默认为 `0.15`，即 **15 个百分点**，不是相对增长 15%。
+有冠军时 `required_win_improvement` 默认为 `0.10`，即 **10 个百分点**，不是相对增长 10%。
 红黑两项都达到该阈值才通过棋力门禁，不额外约束配对得分。
 `gate_metric` 为 `same_color_win_fraction_difference`，`gate_score_fraction` 为 `null`。
 

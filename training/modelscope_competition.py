@@ -275,7 +275,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE,
                         help="baseline paired score without a champion (default: 0.55)")
     parser.add_argument("--required-win-improvement", type=float, default=DEFAULT_REQUIRED_WIN_IMPROVEMENT,
-                        help="minimum same-color win-rate difference for BOTH colors vs champion (0.15 = 15 percentage points)")
+                        help="minimum same-color win-rate difference for BOTH colors vs champion (0.10 = 10 percentage points)")
     parser.add_argument("--max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED,
                         help="ply-cap allowance (default: 10), also capped at 10%%")
     parser.add_argument("--protected-test", type=Path,

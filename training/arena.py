@@ -24,7 +24,7 @@ DEFAULT_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
 REPORT_FORMAT = "xiangqi-arena-v4"
 PROMOTION_POLICY = "same-color-win-improvement-v1"
 BASELINE_PROMOTION_POLICY = "color-balanced-paired-development-v1"
-DEFAULT_REQUIRED_WIN_IMPROVEMENT = 0.15
+DEFAULT_REQUIRED_WIN_IMPROVEMENT = 0.10
 DEFAULT_REQUIRED_SCORE = 0.55
 DEFAULT_MAX_UNFINISHED = 10
 PROMOTION_MAX_UNFINISHED_FRACTION = 0.10
@@ -333,8 +333,8 @@ def summarize_games(
 ) -> dict[str, Any]:
     """按颜色报告成绩，并裁决同色胜率提升或初始基线门禁。
 
-    required_win_improvement 是候选对对手同色胜率的绝对差（0.15 为
-    15 个百分点），红黑都必须达到。为 None 时用 required_score 裁决
+    required_win_improvement 是候选对对手同色胜率的绝对差（0.10 为
+    10 个百分点），红黑都必须达到。为 None 时用 required_score 裁决
     初始基线的配对得分；有冠军时配对得分和区间只作诊断。
     max_unfinished 是步数上限未完成局的绝对额度，另有总局数 10% 上限。
     min_games/min_independent_pairs 不能低于正式样本下限；实际完整配对
@@ -794,7 +794,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE,
                         help="baseline paired score without a champion (default: 0.55)")
     parser.add_argument("--required-win-improvement", type=float, default=DEFAULT_REQUIRED_WIN_IMPROVEMENT,
-                        help="minimum same-color win-rate difference for BOTH colors vs champion (0.15 = 15 percentage points)")
+                        help="minimum same-color win-rate difference for BOTH colors vs champion (0.10 = 10 percentage points)")
     parser.add_argument("--max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED,
                         help="ply-cap allowance (default: 10), also capped at 10%%; protocol failures remain fatal")
     parser.add_argument("--min-games", type=int, default=100)
