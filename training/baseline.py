@@ -14,7 +14,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .arena import (
+    DEFAULT_MAX_UNFINISHED,
     DEFAULT_OPENINGS,
+    DEFAULT_REQUIRED_SCORE,
+    PROMOTION_POLICY,
     Opponent,
     load_openings,
     resolve_search_depth,
@@ -163,8 +166,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit-ms", type=int, default=150)
     parser.add_argument("--protocol-timeout", type=float, default=10.0)
     parser.add_argument("--max-plies", type=int, default=300)
-    parser.add_argument("--required-score", type=float, default=0.70)
-    parser.add_argument("--max-unfinished", type=int, default=5)
+    parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE)
+    parser.add_argument("--max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED)
     parser.add_argument("--min-games", type=int, default=100)
     parser.add_argument("--min-independent-pairs", type=int, default=50)
     return parser.parse_args()
@@ -253,6 +256,7 @@ def run_baseline(args: argparse.Namespace) -> dict[str, Any]:
         },
         "parity": {"engine": str(args.engine), "engine_sha256": sha256_file(args.engine)},
         "arena": {
+            "promotion_policy": PROMOTION_POLICY,
             "search_mode": args.search_mode,
             "protocol_engine": str(args.protocol_engine),
             "protocol_engine_sha256": sha256_file(args.protocol_engine),

@@ -88,7 +88,27 @@ depth11-mg、depth11-eg、depth16-eg 存放数据库。SQLite 表 `XQPGN` 的 `P
 
 ## 新门禁
 
-默认每个对手 100 局，最多容许 5 局因 `ply_cap` 未完成，不计作和棋。
-默认至少 45 个完整开局配对，95% 保守下界仍用实际完整配对计算，要求下界及
-已完成局得分率均不少于 70%。协议错误不享受未完成额度。`--max-unfinished 0`
-恢复原来的零容忍和至少 50 个完整配对；自动迭代对应 `--arena-max-unfinished`。
+`xiangqi-arena-v3` 使用 `color-balanced-paired-development-v1` 策略。
+默认每个对手 100 局，红黑安排相等；最多容许 10 局因 `ply_cap` 未完成，
+另有总局数 10% 上限，不计作和棋。默认至少 40 个不同开局的完整换先对。
+实际完整配对下限为 `max(ceil(开局要求 × 0.8), 开局要求 − 有效未完成额度)`，
+正式开局要求至少 50；`--max-unfinished 0` 要求至少 50 个完整配对。
+
+每个对手的 `summary.by_color.red/black` 是候选的分色统计，
+`opponent_by_color.red/black` 是对手的同色统计，均含胜/和/负、未完成、
+安排局数、完成局数、`win_fraction`（胜局/完成局）和
+`score_fraction`（胜局加半数和局/完成局）；无完成局时比例为 `null`。
+总 `score_fraction` 保留原聚合口径，`color_balanced_score_fraction` 是候选红黑得分率均值。
+它们都是诊断字段，不能代替 `gate_score_fraction`。
+
+`paired_score_fraction` / `gate_score_fraction` 使用每个完整换先对的红黑得分均值，
+重复开局先在开局内平均，再对不同开局等权平均；默认要求达到 55%。
+`score_fraction_ci95` 仍报告配对开局的不确定性区间，但不参与门禁。
+这是一项允许逐步改进的开发策略，不是统计显著性证明。
+`rejection_reasons` 提供拒绝原因；`effective_max_unfinished` 记录绝对额度与 10% 限额的较小值。
+
+`config.promotion_opponents` 记录晋升对象：存在 `champion` 时只要求对冠军的棋力门禁，
+其他对手仅作棋力诊断；无冠军时要求所有配置对手通过。任何对手的协议错误仍阻止晋升。
+训练验证与 Python/C++ 一致性要求保持不变。阈值使用 `--required-score`，
+自动迭代对应 `--arena-required-score`，未完成额度对应 `--arena-max-unfinished`。
+旧 v2 报告保留原结论，不会因为默认值更新就追溯晋升；新策略使用新实验目录。

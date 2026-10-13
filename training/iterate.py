@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .checkpoint import load_checkpoint
-from .arena import DEFAULT_OPENINGS, Opponent, resolve_search_depth, run_arena
+from .arena import (
+    DEFAULT_MAX_UNFINISHED, DEFAULT_OPENINGS, DEFAULT_REQUIRED_SCORE,
+    Opponent, resolve_search_depth, run_arena,
+)
 from .partition import DEFAULT_QUARANTINE_MANIFEST, DEFAULT_TEST_MANIFEST
 
 
@@ -552,8 +555,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arena-time-limit-ms", type=int, default=1_000)
     parser.add_argument("--arena-timeout", type=float, default=10.0)
     parser.add_argument("--arena-max-plies", type=int, default=300)
-    parser.add_argument("--arena-required-score", type=float, default=0.70)
-    parser.add_argument("--arena-max-unfinished", type=int, default=5)
+    parser.add_argument("--arena-required-score", type=float, default=DEFAULT_REQUIRED_SCORE)
+    parser.add_argument("--arena-max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED)
     parser.add_argument("--arena-min-games", type=int, default=100)
     parser.add_argument("--arena-min-independent-pairs", type=int, default=50)
     parser.add_argument("--arena-openings", type=Path)

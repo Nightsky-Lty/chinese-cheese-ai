@@ -21,7 +21,12 @@ from typing import Any, Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OPENINGS = PROJECT_ROOT / "training/examples/arena_openings.json"
 DEFAULT_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
-REPORT_FORMAT = "xiangqi-arena-v2"
+REPORT_FORMAT = "xiangqi-arena-v3"
+PROMOTION_POLICY = "color-balanced-paired-development-v1"
+DEFAULT_REQUIRED_SCORE = 0.55
+DEFAULT_MAX_UNFINISHED = 10
+PROMOTION_MAX_UNFINISHED_FRACTION = 0.10
+PROMOTION_MIN_COMPLETE_PAIR_FRACTION = 0.80
 PROMOTION_MIN_GAMES = 100
 PROMOTION_MIN_INDEPENDENT_PAIRS = 50
 DEFAULT_DEPTH_SEARCH_DEPTH = 4
@@ -273,30 +278,79 @@ def paired_opening_interval(
     }
 
 
+def color_statistics(games: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """按候选执红/执黑统计；未完成局不进入胜率和得分率的分母。
+
+    games 为带候选颜色和赛果的对局记录。win_fraction 为胜局/完成局，
+    score_fraction 为（胜局 + 半数和局）/完成局；无完成局时返回 None。
+    """
+
+    result = {
+        side: {"wins": 0, "draws": 0, "losses": 0, "unfinished": 0}
+        for side in ("red", "black")
+    }
+    for game in games:
+        side = game["candidate_side"]
+        if side not in result:
+            raise ValueError(f"unknown candidate side: {side}")
+        outcome = game["outcome"]
+        if outcome == "unfinished":
+            key = "unfinished"
+        elif outcome == "draw":
+            key = "draws"
+        elif outcome == f"{side}_win":
+            key = "wins"
+        elif outcome in ("red_win", "black_win"):
+            key = "losses"
+        else:
+            raise ValueError(f"unknown game outcome: {outcome}")
+        result[side][key] += 1
+    for counts in result.values():
+        decided = counts["wins"] + counts["draws"] + counts["losses"]
+        counts.update(
+            games=decided + counts["unfinished"], decided_games=decided,
+            win_fraction=counts["wins"] / decided if decided else None,
+            score_fraction=(counts["wins"] + 0.5 * counts["draws"]) / decided if decided else None,
+        )
+    return result
+
+
+def format_color_statistics(counts: dict[str, Any]) -> str:
+    """将一种颜色的统计格式化为可读日志；空分母用 n/a 表示。"""
+
+    win = f"{counts['win_fraction']:.2%}" if counts["win_fraction"] is not None else "n/a"
+    score = f"{counts['score_fraction']:.2%}" if counts["score_fraction"] is not None else "n/a"
+    return (f"W/D/L={counts['wins']}/{counts['draws']}/{counts['losses']} "
+            f"unfinished={counts['unfinished']} win={win} score={score}")
+
+
 def summarize_games(
     games: list[dict[str, Any]], required_score: float, max_unfinished: int,
     min_games: int, min_independent_pairs: int = 50,
 ) -> dict[str, Any]:
-    """统计候选胜和负并裁决门禁。
+    """按颜色报告成绩，以完整换先开局的等权得分裁决开发门禁。
 
-    max_unfinished 是每个对手允许达到步数上限的局数，不包括协议故障；
-    min_independent_pairs 是原开局配对要求，实际完整配对可随额度降低，
-    但至少保留该要求的 90%。required_score 同时约束得分率和保守下界。
+    required_score 只约束配对得分，不约束置信区间或某一种颜色的成绩。
+    max_unfinished 是步数上限未完成局的绝对额度，另有总局数 10% 上限。
+    min_games/min_independent_pairs 不能低于正式样本下限；实际完整配对
+    可随未完成额度降低，但至少保留开局要求的 80%。协议故障直接拒绝。
     """
 
-    wins = losses = draws = unfinished = 0
-    for game in games:
-        outcome = game["outcome"]
-        if outcome == "unfinished":
-            unfinished += 1
-        elif outcome == "draw":
-            draws += 1
-        elif outcome == f"{game['candidate_side']}_win":
-            wins += 1
-        elif outcome in ("red_win", "black_win"):
-            losses += 1
-        else:
-            raise ValueError(f"unknown game outcome: {outcome}")
+    by_color = color_statistics(games)
+    wins, losses, draws, unfinished = (
+        sum(counts[key] for counts in by_color.values())
+        for key in ("wins", "losses", "draws", "unfinished")
+    )
+    # 对手执红的对局就是候选执黑的对局，交换胜负即可得到同色对照。
+    opponent_by_color = {
+        side: {**by_color[other], "wins": by_color[other]["losses"],
+               "losses": by_color[other]["wins"],
+               "win_fraction": (by_color[other]["losses"] / by_color[other]["decided_games"]
+                                if by_color[other]["decided_games"] else None),
+               "score_fraction": (1.0 - by_color[other]["score_fraction"]
+                                  if by_color[other]["score_fraction"] is not None else None)}
+        for side, other in (("red", "black"), ("black", "red"))
+    }
     decided = wins + losses + draws
     score_fraction = (wins + 0.5 * draws) / decided if decided else 0.0
     interval = paired_opening_interval(games)
@@ -304,27 +358,32 @@ def summarize_games(
     # Only a ply-cap truncation is tolerated; protocol errors invalidate the match.
     failed_games = sum(game["outcome"] == "unfinished" and game.get("reason") != "ply_cap"
                        for game in games)
-    lower = interval["lower"]
+    paired_score = interval["mean"] if complete_pairs else None
+    red_score, black_score = (by_color[side]["score_fraction"] for side in ("red", "black"))
+    balanced_score = ((red_score + black_score) / 2.0
+                      if red_score is not None and black_score is not None else None)
+    effective_max_unfinished = min(
+        max_unfinished, math.floor(len(games) * PROMOTION_MAX_UNFINISHED_FRACTION)
+    )
     effective_min_games = max(min_games, PROMOTION_MIN_GAMES)
     effective_min_independent_pairs = max(
         min_independent_pairs, PROMOTION_MIN_INDEPENDENT_PAIRS
     )
     # Each tolerated unfinished game can invalidate at most one paired opening.
-    # Keep at least 90% of the original independent-pair floor even for a large allowance.
+    # 未完成局不能用作和棋；晋升只使用红黑两局都完成的配对。
     required_complete_pairs = max(
-        math.ceil(effective_min_independent_pairs * 0.9),
-        effective_min_independent_pairs - max_unfinished,
+        math.ceil(effective_min_independent_pairs * PROMOTION_MIN_COMPLETE_PAIR_FRACTION),
+        effective_min_independent_pairs - effective_max_unfinished,
     )
-    passed = (
-        len(games) >= effective_min_games
-        and unfinished <= max_unfinished
-        and failed_games == 0
-        and decided > 0
-        and complete_pairs >= required_complete_pairs
-        and score_fraction >= required_score
-        and lower is not None
-        and lower >= required_score
-    )
+    checks = {
+        "insufficient_games": len(games) >= effective_min_games,
+        "unbalanced_scheduled_colors": by_color["red"]["games"] == by_color["black"]["games"],
+        "unfinished_limit_exceeded": unfinished <= effective_max_unfinished,
+        "protocol_failure": failed_games == 0,
+        "insufficient_complete_opening_pairs": complete_pairs >= required_complete_pairs,
+        "paired_score_below_threshold": paired_score is not None and paired_score >= required_score,
+    }
+    rejection_reasons = [reason for reason, satisfied in checks.items() if not satisfied]
     return {
         "wins": wins,
         "draws": draws,
@@ -336,6 +395,14 @@ def summarize_games(
         "required_complete_paired_openings": required_complete_pairs,
         "failed_games": failed_games,
         "score_fraction": score_fraction,
+        "win_fraction": wins / decided if decided else None,
+        "by_color": by_color,
+        "opponent_by_color": opponent_by_color,
+        "color_balanced_score_fraction": balanced_score,
+        "paired_score_fraction": paired_score,
+        "gate_score_fraction": paired_score,
+        "gate_policy": PROMOTION_POLICY,
+        "rejection_reasons": rejection_reasons,
         "score_fraction_ci95": interval,
         "required_score": required_score,
         "min_games": min_games,
@@ -343,7 +410,9 @@ def summarize_games(
         "effective_min_games": effective_min_games,
         "effective_min_independent_pairs": effective_min_independent_pairs,
         "max_unfinished": max_unfinished,
-        "passed": passed,
+        "effective_max_unfinished": effective_max_unfinished,
+        "max_unfinished_fraction": PROMOTION_MAX_UNFINISHED_FRACTION,
+        "passed": not rejection_reasons,
     }
 
 
@@ -470,8 +539,8 @@ def run_arena(
     depth: int = 4,
     time_limit_ms: int | None = 1_000,
     max_plies: int = 300,
-    required_score: float = 0.70,
-    max_unfinished: int = 5,
+    required_score: float = DEFAULT_REQUIRED_SCORE,
+    max_unfinished: int = DEFAULT_MAX_UNFINISHED,
     min_games: int = 100,
     min_independent_pairs: int = 50,
     openings_path: Path = DEFAULT_OPENINGS,
@@ -511,7 +580,13 @@ def run_arena(
         (pair_id, openings[pair_id % len(openings)])
         for pair_id in range(pair_count)
     ]
+    # 有现任冠军时只对冠军要求棋力提升；其他对手是诊断对照。
+    # 没有冠军时保留对配置对手的基线要求，不能无条件晋升第一代。
+    promotion_opponents = (["champion"] if any(item.name == "champion" for item in opponents)
+                           else [item.name for item in opponents])
     config = {
+        "promotion_policy": PROMOTION_POLICY,
+        "promotion_opponents": promotion_opponents,
         "search_mode": search_mode,
         "depth": depth,
         "time_limit_ms": time_limit_ms if search_mode == "time" else None,
@@ -519,6 +594,8 @@ def run_arena(
         "max_plies": max_plies,
         "required_score": required_score,
         "max_unfinished": max_unfinished,
+        "max_unfinished_fraction": PROMOTION_MAX_UNFINISHED_FRACTION,
+        "min_complete_pair_fraction": PROMOTION_MIN_COMPLETE_PAIR_FRACTION,
         "min_games": min_games,
         "min_independent_pairs": min_independent_pairs,
         "promotion_floor": {
@@ -527,7 +604,8 @@ def run_arena(
         },
         "uncertainty": {
             "confidence": 0.95,
-            "gate_interval": "paired-opening-cluster-hoeffding-bound",
+            "diagnostic_interval": "paired-opening-cluster-hoeffding-bound",
+            "used_for_promotion": False,
             "diagnostic_bootstrap_samples": 10_000,
             "diagnostic_bootstrap_seed": 0x5849414E,
         },
@@ -634,11 +712,22 @@ def run_arena(
                 },
             }
             _atomic_report(output, report)
+            for side in ("red", "black"):
+                own = summary["by_color"][side]
+                other = summary["opponent_by_color"][side]
+                print(
+                    f"arena {opponent.name} {side}: candidate {format_color_statistics(own)}; "
+                    f"opponent {format_color_statistics(other)}", flush=True,
+                )
             print(f"arena {opponent.name}: {summary}; report: {output}", flush=True)
         report["passed"] = all(
-            result["summary"]["passed"]
-            for result in report["opponents"].values()
-        )
+            report["opponents"][name]["summary"]["passed"] for name in promotion_opponents
+        ) and all(result["summary"]["failed_games"] == 0 for result in report["opponents"].values())
+        report["rejection_reasons"] = [
+            f"{name}: {reason}" for name, result in report["opponents"].items()
+            for reason in result["summary"]["rejection_reasons"]
+            if name in promotion_opponents or reason == "protocol_failure"
+        ]
         _atomic_report(output, report)
         return report
     except BaseException:
@@ -667,9 +756,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit-ms", type=int, default=1_000)
     parser.add_argument("--protocol-timeout", type=float, default=10.0)
     parser.add_argument("--max-plies", type=int, default=300)
-    parser.add_argument("--required-score", type=float, default=0.70)
-    parser.add_argument("--max-unfinished", type=int, default=5,
-                        help="maximum ply-cap unfinished games per opponent; protocol failures remain fatal")
+    parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE,
+                        help="minimum complete-pair score (default: 0.55); CI is diagnostic only")
+    parser.add_argument("--max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED,
+                        help="ply-cap allowance (default: 10), also capped at 10%%; protocol failures remain fatal")
     parser.add_argument("--min-games", type=int, default=100)
     parser.add_argument("--min-independent-pairs", type=int, default=50)
     return parser.parse_args()

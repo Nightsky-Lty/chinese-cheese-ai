@@ -13,7 +13,10 @@ import sys
 import time
 from typing import Any
 
-from .arena import DEFAULT_OPENINGS, Opponent, run_arena
+from .arena import (
+    DEFAULT_MAX_UNFINISHED, DEFAULT_OPENINGS, DEFAULT_REQUIRED_SCORE,
+    PROMOTION_POLICY, Opponent, run_arena,
+)
 from .baseline import validation_gate
 from .checkpoint import load_checkpoint
 from .diagnostics import write_json
@@ -110,7 +113,8 @@ def run(args: argparse.Namespace) -> None:
               "protocol_engine": artifact(ROOT / "build/make/xiangqi_protocol"),
               "openings": artifact(args.openings),
               "arena": {"mode": "time", "depth_cap": 64, "time_limit_ms": args.time_limit_ms,
-                        "min_games": 100, "min_independent_pairs": 50, "required_score": 0.70,
+                        "promotion_policy": PROMOTION_POLICY,
+                        "min_games": 100, "min_independent_pairs": 50, "required_score": args.required_score,
                         "max_unfinished": args.max_unfinished, "max_plies": args.max_plies}}
     if plan_path.exists():
         plan = json.loads(plan_path.read_text())
@@ -209,7 +213,7 @@ def run(args: argparse.Namespace) -> None:
         arena = run_arena(Path(config["protocol_engine"]["path"]), directory / "best.nnue", opponents,
                           arena_path, search_mode="time", depth=64, time_limit_ms=args.time_limit_ms,
                           max_plies=args.max_plies, min_games=100, min_independent_pairs=50,
-                          required_score=0.70, max_unfinished=args.max_unfinished, openings_path=args.openings)
+                          required_score=args.required_score, max_unfinished=args.max_unfinished, openings_path=args.openings)
         state["stages"]["arena"].update(complete=True, passed=arena["passed"],
                                          elapsed_seconds=time.monotonic() - started, finished_at=now())
         write_json(state_path, state)
@@ -217,7 +221,7 @@ def run(args: argparse.Namespace) -> None:
         arena = json.loads(Path(state["stages"]["arena"]["report"]).read_text())
     if not arena["passed"]:
         state.update(status="rejected", finished_at=now(), champion_changed=False,
-                     reason="one or more arena opponents failed the existing promotion gate")
+                     reason="arena promotion target or protocol safety gate failed")
         write_json(state_path, state)
         print(f"candidate retained; champion unchanged; report: {state_path}", flush=True)
         return
@@ -265,14 +269,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openings", type=Path, default=DEFAULT_OPENINGS)
     parser.add_argument("--time-limit-ms", type=int, default=50)
     parser.add_argument("--max-plies", type=int, default=300)
-    parser.add_argument("--max-unfinished", type=int, default=5,
-                        help="maximum ply-cap unfinished games per opponent")
+    parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE,
+                        help="minimum complete-pair score against the champion (default: 0.55)")
+    parser.add_argument("--max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED,
+                        help="ply-cap allowance (default: 10), also capped at 10%%")
     parser.add_argument("--protected-test", type=Path,
                         default=DATA / "competition-1m-v1/test-manifest.json",
                         help="fixed test anchors excluded from newly sampled datasets")
     args = parser.parse_args()
     if min(args.train_count, args.epochs, args.batch_size, args.time_limit_ms, args.max_plies) <= 0 or args.max_unfinished < 0:
         parser.error("sample, epoch, batch, time and ply limits must be positive")
+    if not 0.0 <= args.required_score <= 1.0:
+        parser.error("required score must be between 0 and 1")
     return args
 
 
