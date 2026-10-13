@@ -15,6 +15,7 @@ from typing import Any
 
 from .arena import (
     DEFAULT_MAX_UNFINISHED, DEFAULT_OPENINGS, DEFAULT_REQUIRED_SCORE,
+    DEFAULT_REQUIRED_WIN_IMPROVEMENT,
     PROMOTION_POLICY, Opponent, run_arena,
 )
 from .baseline import validation_gate
@@ -115,6 +116,7 @@ def run(args: argparse.Namespace) -> None:
               "arena": {"mode": "time", "depth_cap": 64, "time_limit_ms": args.time_limit_ms,
                         "promotion_policy": PROMOTION_POLICY,
                         "min_games": 100, "min_independent_pairs": 50, "required_score": args.required_score,
+                        "required_win_improvement": args.required_win_improvement,
                         "max_unfinished": args.max_unfinished, "max_plies": args.max_plies}}
     if plan_path.exists():
         plan = json.loads(plan_path.read_text())
@@ -213,7 +215,8 @@ def run(args: argparse.Namespace) -> None:
         arena = run_arena(Path(config["protocol_engine"]["path"]), directory / "best.nnue", opponents,
                           arena_path, search_mode="time", depth=64, time_limit_ms=args.time_limit_ms,
                           max_plies=args.max_plies, min_games=100, min_independent_pairs=50,
-                          required_score=args.required_score, max_unfinished=args.max_unfinished, openings_path=args.openings)
+                          required_score=args.required_score, required_win_improvement=args.required_win_improvement,
+                          max_unfinished=args.max_unfinished, openings_path=args.openings)
         state["stages"]["arena"].update(complete=True, passed=arena["passed"],
                                          elapsed_seconds=time.monotonic() - started, finished_at=now())
         write_json(state_path, state)
@@ -270,7 +273,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit-ms", type=int, default=50)
     parser.add_argument("--max-plies", type=int, default=300)
     parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE,
-                        help="minimum complete-pair score against the champion (default: 0.55)")
+                        help="baseline paired score without a champion (default: 0.55)")
+    parser.add_argument("--required-win-improvement", type=float, default=DEFAULT_REQUIRED_WIN_IMPROVEMENT,
+                        help="minimum same-color win-rate difference for BOTH colors vs champion (0.15 = 15 percentage points)")
     parser.add_argument("--max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED,
                         help="ply-cap allowance (default: 10), also capped at 10%%")
     parser.add_argument("--protected-test", type=Path,
@@ -281,6 +286,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("sample, epoch, batch, time and ply limits must be positive")
     if not 0.0 <= args.required_score <= 1.0:
         parser.error("required score must be between 0 and 1")
+    if not 0.0 <= args.required_win_improvement <= 1.0:
+        parser.error("required win improvement must be between 0 and 1")
     return args
 
 

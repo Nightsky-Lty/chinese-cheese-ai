@@ -17,6 +17,7 @@ from typing import Any, Sequence
 from .checkpoint import load_checkpoint
 from .arena import (
     DEFAULT_MAX_UNFINISHED, DEFAULT_OPENINGS, DEFAULT_REQUIRED_SCORE,
+    DEFAULT_REQUIRED_WIN_IMPROVEMENT,
     Opponent, resolve_search_depth, run_arena,
 )
 from .partition import DEFAULT_QUARANTINE_MANIFEST, DEFAULT_TEST_MANIFEST
@@ -555,7 +556,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arena-time-limit-ms", type=int, default=1_000)
     parser.add_argument("--arena-timeout", type=float, default=10.0)
     parser.add_argument("--arena-max-plies", type=int, default=300)
-    parser.add_argument("--arena-required-score", type=float, default=DEFAULT_REQUIRED_SCORE)
+    parser.add_argument("--arena-required-score", type=float, default=DEFAULT_REQUIRED_SCORE,
+                        help="baseline paired score without a champion (default: 0.55)")
+    parser.add_argument("--arena-required-win-improvement", type=float, default=DEFAULT_REQUIRED_WIN_IMPROVEMENT,
+                        help="same-color win-rate difference against champion; 0.15 = 15 percentage points")
     parser.add_argument("--arena-max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED)
     parser.add_argument("--arena-min-games", type=int, default=100)
     parser.add_argument("--arena-min-independent-pairs", type=int, default=50)
@@ -611,6 +615,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("arena depth, plies and minimum games must be positive")
     if not 0.0 <= args.arena_required_score <= 1.0 or args.arena_max_unfinished < 0:
         raise ValueError("invalid arena promotion threshold")
+    if not 0.0 <= args.arena_required_win_improvement <= 1.0:
+        raise ValueError("arena required win improvement must be between 0 and 1")
 
 
 def main() -> None:
@@ -739,6 +745,7 @@ def main() -> None:
             time_limit_ms=args.arena_time_limit_ms,
             max_plies=args.arena_max_plies,
             required_score=args.arena_required_score,
+            required_win_improvement=args.arena_required_win_improvement,
             max_unfinished=args.arena_max_unfinished,
             min_games=args.arena_min_games,
             min_independent_pairs=args.arena_min_independent_pairs,

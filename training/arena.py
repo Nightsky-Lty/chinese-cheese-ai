@@ -21,8 +21,10 @@ from typing import Any, Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OPENINGS = PROJECT_ROOT / "training/examples/arena_openings.json"
 DEFAULT_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
-REPORT_FORMAT = "xiangqi-arena-v3"
-PROMOTION_POLICY = "color-balanced-paired-development-v1"
+REPORT_FORMAT = "xiangqi-arena-v4"
+PROMOTION_POLICY = "same-color-win-improvement-v1"
+BASELINE_PROMOTION_POLICY = "color-balanced-paired-development-v1"
+DEFAULT_REQUIRED_WIN_IMPROVEMENT = 0.15
 DEFAULT_REQUIRED_SCORE = 0.55
 DEFAULT_MAX_UNFINISHED = 10
 PROMOTION_MAX_UNFINISHED_FRACTION = 0.10
@@ -327,10 +329,13 @@ def format_color_statistics(counts: dict[str, Any]) -> str:
 def summarize_games(
     games: list[dict[str, Any]], required_score: float, max_unfinished: int,
     min_games: int, min_independent_pairs: int = 50,
+    *, required_win_improvement: float | None = None,
 ) -> dict[str, Any]:
-    """按颜色报告成绩，以完整换先开局的等权得分裁决开发门禁。
+    """按颜色报告成绩，并裁决同色胜率提升或初始基线门禁。
 
-    required_score 只约束配对得分，不约束置信区间或某一种颜色的成绩。
+    required_win_improvement 是候选对对手同色胜率的绝对差（0.15 为
+    15 个百分点），红黑都必须达到。为 None 时用 required_score 裁决
+    初始基线的配对得分；有冠军时配对得分和区间只作诊断。
     max_unfinished 是步数上限未完成局的绝对额度，另有总局数 10% 上限。
     min_games/min_independent_pairs 不能低于正式样本下限；实际完整配对
     可随未完成额度降低，但至少保留开局要求的 80%。协议故障直接拒绝。
@@ -351,6 +356,12 @@ def summarize_games(
                                   if by_color[other]["score_fraction"] is not None else None)}
         for side, other in (("red", "black"), ("black", "red"))
     }
+    win_improvement = {
+        side: (by_color[side]["win_fraction"] - opponent_by_color[side]["win_fraction"]
+               if by_color[side]["win_fraction"] is not None
+               and opponent_by_color[side]["win_fraction"] is not None else None)
+        for side in ("red", "black")
+    }
     decided = wins + losses + draws
     score_fraction = (wins + 0.5 * draws) / decided if decided else 0.0
     interval = paired_opening_interval(games)
@@ -370,7 +381,7 @@ def summarize_games(
         min_independent_pairs, PROMOTION_MIN_INDEPENDENT_PAIRS
     )
     # Each tolerated unfinished game can invalidate at most one paired opening.
-    # 未完成局不能用作和棋；晋升只使用红黑两局都完成的配对。
+    # 未完成局不能用作和棋；完整配对数仍是样本质量底线。
     required_complete_pairs = max(
         math.ceil(effective_min_independent_pairs * PROMOTION_MIN_COMPLETE_PAIR_FRACTION),
         effective_min_independent_pairs - effective_max_unfinished,
@@ -381,8 +392,18 @@ def summarize_games(
         "unfinished_limit_exceeded": unfinished <= effective_max_unfinished,
         "protocol_failure": failed_games == 0,
         "insufficient_complete_opening_pairs": complete_pairs >= required_complete_pairs,
-        "paired_score_below_threshold": paired_score is not None and paired_score >= required_score,
     }
+    if required_win_improvement is None:
+        checks["paired_score_below_threshold"] = paired_score is not None and paired_score >= required_score
+    else:
+        if not 0.0 <= required_win_improvement <= 1.0:
+            raise ValueError("required win improvement must be between 0 and 1")
+        for side in ("red", "black"):
+            improvement = win_improvement[side]
+            # 只消除比例相减的浮点舍入误差，不放宽用户要求的提升幅度。
+            checks[f"{side}_win_improvement_below_threshold"] = (
+                improvement is not None and improvement + 1e-12 >= required_win_improvement
+            )
     rejection_reasons = [reason for reason, satisfied in checks.items() if not satisfied]
     return {
         "wins": wins,
@@ -400,8 +421,12 @@ def summarize_games(
         "opponent_by_color": opponent_by_color,
         "color_balanced_score_fraction": balanced_score,
         "paired_score_fraction": paired_score,
-        "gate_score_fraction": paired_score,
-        "gate_policy": PROMOTION_POLICY,
+        "gate_score_fraction": paired_score if required_win_improvement is None else None,
+        "gate_metric": ("paired_score_fraction" if required_win_improvement is None
+                        else "same_color_win_fraction_difference"),
+        "gate_policy": BASELINE_PROMOTION_POLICY if required_win_improvement is None else PROMOTION_POLICY,
+        "win_improvement_by_color": win_improvement,
+        "required_win_improvement": required_win_improvement,
         "rejection_reasons": rejection_reasons,
         "score_fraction_ci95": interval,
         "required_score": required_score,
@@ -540,6 +565,7 @@ def run_arena(
     time_limit_ms: int | None = 1_000,
     max_plies: int = 300,
     required_score: float = DEFAULT_REQUIRED_SCORE,
+    required_win_improvement: float = DEFAULT_REQUIRED_WIN_IMPROVEMENT,
     max_unfinished: int = DEFAULT_MAX_UNFINISHED,
     min_games: int = 100,
     min_independent_pairs: int = 50,
@@ -560,6 +586,8 @@ def run_arena(
         raise ValueError("minimum game count must be even for candidate-color pairs")
     if not 0.0 <= required_score <= 1.0 or max_unfinished < 0:
         raise ValueError("invalid arena promotion threshold")
+    if not 0.0 <= required_win_improvement <= 1.0:
+        raise ValueError("required win improvement must be between 0 and 1")
     if not opponents:
         raise ValueError("at least one arena opponent is required")
     if output.exists() or output.with_suffix(output.suffix + ".tmp").exists():
@@ -585,7 +613,7 @@ def run_arena(
     promotion_opponents = (["champion"] if any(item.name == "champion" for item in opponents)
                            else [item.name for item in opponents])
     config = {
-        "promotion_policy": PROMOTION_POLICY,
+        "promotion_policy": PROMOTION_POLICY if promotion_opponents == ["champion"] else BASELINE_PROMOTION_POLICY,
         "promotion_opponents": promotion_opponents,
         "search_mode": search_mode,
         "depth": depth,
@@ -593,6 +621,7 @@ def run_arena(
         "time_depth_cap": depth if search_mode == "time" else None,
         "max_plies": max_plies,
         "required_score": required_score,
+        "required_win_improvement": required_win_improvement,
         "max_unfinished": max_unfinished,
         "max_unfinished_fraction": PROMOTION_MAX_UNFINISHED_FRACTION,
         "min_complete_pair_fraction": PROMOTION_MIN_COMPLETE_PAIR_FRACTION,
@@ -703,6 +732,7 @@ def run_arena(
             summary = summarize_games(
                 games, required_score, max_unfinished, min_games,
                 min_independent_pairs,
+                required_win_improvement=(required_win_improvement if opponent.name == "champion" else None),
             )
             report["opponents"][opponent.name] = {
                 "summary": summary,
@@ -719,6 +749,11 @@ def run_arena(
                     f"arena {opponent.name} {side}: candidate {format_color_statistics(own)}; "
                     f"opponent {format_color_statistics(other)}", flush=True,
                 )
+                improvement = summary["win_improvement_by_color"][side]
+                if opponent.name == "champion":
+                    display = f"{improvement * 100:+.2f} pp" if improvement is not None else "n/a"
+                    print(f"arena champion {side}: win improvement={display}; "
+                          f"required={required_win_improvement * 100:.2f} pp", flush=True)
             print(f"arena {opponent.name}: {summary}; report: {output}", flush=True)
         report["passed"] = all(
             report["opponents"][name]["summary"]["passed"] for name in promotion_opponents
@@ -757,7 +792,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol-timeout", type=float, default=10.0)
     parser.add_argument("--max-plies", type=int, default=300)
     parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE,
-                        help="minimum complete-pair score (default: 0.55); CI is diagnostic only")
+                        help="baseline paired score without a champion (default: 0.55)")
+    parser.add_argument("--required-win-improvement", type=float, default=DEFAULT_REQUIRED_WIN_IMPROVEMENT,
+                        help="minimum same-color win-rate difference for BOTH colors vs champion (0.15 = 15 percentage points)")
     parser.add_argument("--max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED,
                         help="ply-cap allowance (default: 10), also capped at 10%%; protocol failures remain fatal")
     parser.add_argument("--min-games", type=int, default=100)
@@ -784,6 +821,7 @@ def main() -> None:
         time_limit_ms=args.time_limit_ms,
         max_plies=args.max_plies,
         required_score=args.required_score,
+        required_win_improvement=args.required_win_improvement,
         max_unfinished=args.max_unfinished,
         min_games=args.min_games,
         min_independent_pairs=args.min_independent_pairs,

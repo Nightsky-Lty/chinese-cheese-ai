@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .arena import (
+    BASELINE_PROMOTION_POLICY,
     DEFAULT_MAX_UNFINISHED,
     DEFAULT_OPENINGS,
     DEFAULT_REQUIRED_SCORE,
+    DEFAULT_REQUIRED_WIN_IMPROVEMENT,
     PROMOTION_POLICY,
     Opponent,
     load_openings,
@@ -166,7 +168,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit-ms", type=int, default=150)
     parser.add_argument("--protocol-timeout", type=float, default=10.0)
     parser.add_argument("--max-plies", type=int, default=300)
-    parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE)
+    parser.add_argument("--required-score", type=float, default=DEFAULT_REQUIRED_SCORE,
+                        help="baseline paired score without a champion (default: 0.55)")
+    parser.add_argument("--required-win-improvement", type=float, default=DEFAULT_REQUIRED_WIN_IMPROVEMENT,
+                        help="same-color win-rate difference against champion; 0.15 = 15 percentage points")
     parser.add_argument("--max-unfinished", type=int, default=DEFAULT_MAX_UNFINISHED)
     parser.add_argument("--min-games", type=int, default=100)
     parser.add_argument("--min-independent-pairs", type=int, default=50)
@@ -198,6 +203,8 @@ def run_baseline(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("min-games must be positive and even; min-independent-pairs positive")
     if not 0.0 <= args.required_score <= 1.0 or args.max_unfinished < 0:
         raise ValueError("invalid arena promotion threshold")
+    if not 0.0 <= args.required_win_improvement <= 1.0:
+        raise ValueError("required win improvement must be between 0 and 1")
 
     args.work_dir = args.work_dir.resolve()
     args.datasets = [path.resolve() for path in args.datasets]
@@ -256,7 +263,7 @@ def run_baseline(args: argparse.Namespace) -> dict[str, Any]:
         },
         "parity": {"engine": str(args.engine), "engine_sha256": sha256_file(args.engine)},
         "arena": {
-            "promotion_policy": PROMOTION_POLICY,
+            "promotion_policy": PROMOTION_POLICY if args.champion else BASELINE_PROMOTION_POLICY,
             "search_mode": args.search_mode,
             "protocol_engine": str(args.protocol_engine),
             "protocol_engine_sha256": sha256_file(args.protocol_engine),
@@ -267,6 +274,7 @@ def run_baseline(args: argparse.Namespace) -> dict[str, Any]:
             "protocol_timeout": args.protocol_timeout,
             "max_plies": args.max_plies,
             "required_score": args.required_score,
+            "required_win_improvement": args.required_win_improvement,
             "max_unfinished": args.max_unfinished,
             "min_games": args.min_games,
             "min_independent_pairs": args.min_independent_pairs,
@@ -378,6 +386,7 @@ def run_baseline(args: argparse.Namespace) -> dict[str, Any]:
             time_limit_ms=args.time_limit_ms,
             max_plies=args.max_plies,
             required_score=args.required_score,
+            required_win_improvement=args.required_win_improvement,
             max_unfinished=args.max_unfinished,
             min_games=args.min_games,
             min_independent_pairs=args.min_independent_pairs,

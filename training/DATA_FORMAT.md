@@ -88,7 +88,8 @@ depth11-mg、depth11-eg、depth16-eg 存放数据库。SQLite 表 `XQPGN` 的 `P
 
 ## 新门禁
 
-`xiangqi-arena-v3` 使用 `color-balanced-paired-development-v1` 策略。
+`xiangqi-arena-v4` 有冠军时使用 `same-color-win-improvement-v1` 策略，
+无冠军时使用 `color-balanced-paired-development-v1` 基线策略。
 默认每个对手 100 局，红黑安排相等；最多容许 10 局因 `ply_cap` 未完成，
 另有总局数 10% 上限，不计作和棋。默认至少 40 个不同开局的完整换先对。
 实际完整配对下限为 `max(ceil(开局要求 × 0.8), 开局要求 − 有效未完成额度)`，
@@ -99,16 +100,25 @@ depth11-mg、depth11-eg、depth16-eg 存放数据库。SQLite 表 `XQPGN` 的 `P
 安排局数、完成局数、`win_fraction`（胜局/完成局）和
 `score_fraction`（胜局加半数和局/完成局）；无完成局时比例为 `null`。
 总 `score_fraction` 保留原聚合口径，`color_balanced_score_fraction` 是候选红黑得分率均值。
-它们都是诊断字段，不能代替 `gate_score_fraction`。
+它们都是诊断字段，不能代替门禁指标。
 
-`paired_score_fraction` / `gate_score_fraction` 使用每个完整换先对的红黑得分均值，
-重复开局先在开局内平均，再对不同开局等权平均；默认要求达到 55%。
+`win_improvement_by_color.red/black` 为候选胜率减对手的同色胜率，
+直接使用本次比赛的完成局统计，不读取冠军旧比赛胜率。无可比完成局时为 `null`，不能通过。
+有冠军时 `required_win_improvement` 默认为 `0.15`，即 **15 个百分点**，不是相对增长 15%。
+红黑两项都达到该阈值才通过棋力门禁，不额外约束配对得分。
+`gate_metric` 为 `same_color_win_fraction_difference`，`gate_score_fraction` 为 `null`。
+
+`paired_score_fraction` 使用每个完整换先对的红黑得分均值，
+重复开局先在开局内平均，再对不同开局等权平均，仅作有冠军时的诊断。
+无冠军时 `gate_metric` 为 `paired_score_fraction`，`gate_score_fraction` 等于配对得分，
+`required_win_improvement` 为 `null`，默认要求配对得分达到 55%。
 `score_fraction_ci95` 仍报告配对开局的不确定性区间，但不参与门禁。
 这是一项允许逐步改进的开发策略，不是统计显著性证明。
 `rejection_reasons` 提供拒绝原因；`effective_max_unfinished` 记录绝对额度与 10% 限额的较小值。
 
 `config.promotion_opponents` 记录晋升对象：存在 `champion` 时只要求对冠军的棋力门禁，
 其他对手仅作棋力诊断；无冠军时要求所有配置对手通过。任何对手的协议错误仍阻止晋升。
-训练验证与 Python/C++ 一致性要求保持不变。阈值使用 `--required-score`，
-自动迭代对应 `--arena-required-score`，未完成额度对应 `--arena-max-unfinished`。
-旧 v2 报告保留原结论，不会因为默认值更新就追溯晋升；新策略使用新实验目录。
+训练验证与 Python/C++ 一致性要求保持不变。同色胜率阈值使用 `--required-win-improvement`，
+自动迭代对应 `--arena-required-win-improvement`；`--required-score` / `--arena-required-score`
+仅控制无冠军时的基线。未完成额度对应 `--arena-max-unfinished`。
+旧 v2/v3 报告保留原结论，不会因为默认值更新就追溯晋升；新策略使用新实验目录。
